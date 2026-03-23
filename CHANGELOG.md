@@ -1,5 +1,47 @@
 # hakuzu Changelog
 
+## Phase 6: Behavioral Parity with graphd/strana
+
+Deterministic query rewriting and correctness fixes from behavioral audit against graphd.
+
+### Deterministic query rewriter
+Ported from strana's `rewriter.rs`. Rewrites non-deterministic Cypher functions to parameter references with concrete values before execution and journaling, ensuring followers replay identical results.
+
+- `gen_random_uuid()` → `$__hakuzu_uuid_N` (UUID v4)
+- `current_timestamp()` → `$__hakuzu_now_N` (ISO 8601 UTC with Z suffix)
+- `current_date()` → `$__hakuzu_date_N` (ISO 8601 date)
+- `REMOVE n.prop` → `SET n.prop = NULL` (Kuzu doesn't support REMOVE)
+- Multi-property: `REMOVE n.a, n.b` → `SET n.a = NULL, n.b = NULL`
+- String-literal aware, case-insensitive, word-boundary checks, backtick-quoted identifiers
+
+Wired into `execute_write_local()` — journals the **rewritten** query + **merged** params.
+
+Files: `src/rewriter.rs` (new, 732 lines), `src/database.rs`
+
+Tests (41 unit): function rewrites, string literal protection, case/whitespace, REMOVE variants, merge_params, word boundary regression, multi-item REMOVE, date helpers
+
+### Silent failure elimination
+- `replay.rs`: entry failure now aborts transaction + returns error (was: `warn!` + skip + advance sequence — silent data divergence)
+- `replicator.rs`: pull failure logged at `error!` level (was: `warn!`)
+- `REMOVE` added to mutation keywords (label removal like `REMOVE n:Label` was not detected as a mutation)
+
+### Param type conversion fixes
+- `json_to_param_value()`: u64 > i64::MAX → f64 (was: Null — data loss)
+- `json_to_param_value()`: Object → serialized JSON string (was: Null — data loss)
+- `json_to_lbug()`: Object → `lbug::Value::String` of serialized JSON (was: error)
+
+Files: `src/values.rs` (27 new tests)
+
+### Follower replay locking
+`KuzuFollowerBehavior` now holds `write_mutex` + `snapshot_lock` during replay via `with_locks()`. Prevents concurrent reads from seeing partial replay state. `write_mutex` changed from inline to `Arc<tokio::sync::Mutex<()>>` for sharing between `HaKuzuInner` and follower behavior.
+
+Files: `src/follower_behavior.rs`, `src/database.rs`
+
+### Dependency rename
+`hadb-s3` → `hadb-lease-s3` (upstream crate rename).
+
+137 tests pass (116 lib + 7 ha_database integration + 14 replay/replicator integration).
+
 ## Phase 5: Operational Resilience + Observability
 
 ### Prometheus metrics
