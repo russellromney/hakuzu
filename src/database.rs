@@ -18,13 +18,14 @@ use anyhow::{anyhow, Result};
 use axum::routing::post;
 use graphstream::journal::{JournalCommand, JournalSender, PendingEntry};
 use hadb::{Coordinator, CoordinatorConfig, LeaseConfig, Role, RoleEvent};
-use hadb_s3::S3LeaseStore;
+use hadb_lease_s3::S3LeaseStore;
 
 use crate::error::HakuzuError;
 use crate::follower_behavior::KuzuFollowerBehavior;
 use crate::forwarding::{self, ForwardingState};
 use crate::mutation::is_mutation;
 use crate::replicator::KuzuReplicator;
+use crate::rewriter;
 use crate::snapshot;
 use crate::values;
 
@@ -256,11 +257,16 @@ impl HaKuzuBuilder {
         // Open database (potentially from snapshot data).
         let db = Arc::new(open_database(&db_path, schema)?);
 
-        // Build follower behavior.
+        // Create locks early so they can be shared with follower behavior.
+        let write_mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let snapshot_lock = Arc::new(std::sync::RwLock::new(()));
+
+        // Build follower behavior — shares locks with HaKuzuInner for replay serialization.
         let follower_s3 = aws_sdk_s3::Client::new(&s3_config);
         let follower_behavior = Arc::new(
             KuzuFollowerBehavior::new(follower_s3, self.bucket.clone())
-                .with_shared_db(db.clone()),
+                .with_shared_db(db.clone())
+                .with_locks(write_mutex.clone(), snapshot_lock.clone()),
         );
 
         // Build snapshot context for leader.
@@ -301,6 +307,7 @@ impl HaKuzuBuilder {
             self.forward_timeout,
             self.secret,
             snapshot_ctx,
+            Some((write_mutex, snapshot_lock)),
         )
         .await
     }
@@ -320,7 +327,7 @@ pub(crate) struct HaKuzuInner {
     pub(crate) db: Arc<lbug::Database>,
     pub(crate) db_name: String,
     role: AtomicU8,
-    pub(crate) write_mutex: tokio::sync::Mutex<()>,
+    pub(crate) write_mutex: Arc<tokio::sync::Mutex<()>>,
     read_semaphore: tokio::sync::Semaphore,
     pub(crate) snapshot_lock: Arc<std::sync::RwLock<()>>,
     journal_sender: RwLock<Option<JournalSender>>,
@@ -365,34 +372,43 @@ impl HaKuzuInner {
     }
 
     /// Execute a write locally (leader path). Used by both HaKuzu::execute and forwarding handler.
+    ///
+    /// Rewrites non-deterministic functions (gen_random_uuid, current_timestamp, etc.)
+    /// to parameter references with concrete values before execution. Journals the
+    /// **rewritten** query + **merged** params so followers replay deterministically.
     pub(crate) async fn execute_write_local(
         &self,
         cypher: &str,
         params: Option<&serde_json::Value>,
     ) -> Result<()> {
         let _guard = self.write_mutex.lock().await;
+
+        // Rewrite non-deterministic functions before execution.
+        let rewrite = rewriter::rewrite_query(cypher);
+        let merged_params = rewriter::merge_params(params, &rewrite.generated_params);
+
         let db = self.db.clone();
         let lock = self.snapshot_lock.clone();
-        let cypher_owned = cypher.to_string();
-        let params_owned = params.cloned();
+        let rewritten_query = rewrite.query.clone();
+        let exec_params = merged_params.clone();
 
         tokio::task::spawn_blocking(move || {
             let conn = lbug::Connection::new(&db)
                 .map_err(|e| anyhow!("Failed to create connection: {e}"))?;
             let _snap = lock.read().unwrap_or_else(|e| e.into_inner());
 
-            if let Some(ref p) = params_owned {
+            if let Some(ref p) = exec_params {
                 let lbug_params = values::json_params_to_lbug(p)
                     .map_err(|e| anyhow!("Param conversion failed: {e}"))?;
                 let refs: Vec<(&str, lbug::Value)> =
                     lbug_params.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                 let mut stmt = conn
-                    .prepare(&cypher_owned)
+                    .prepare(&rewritten_query)
                     .map_err(|e| anyhow!("Prepare failed: {e}"))?;
                 conn.execute(&mut stmt, refs)
                     .map_err(|e| anyhow!("Execute failed: {e}"))?;
             } else {
-                conn.query(&cypher_owned)
+                conn.query(&rewritten_query)
                     .map_err(|e| anyhow!("Query failed: {e}"))?;
             }
             Ok::<(), anyhow::Error>(())
@@ -400,14 +416,14 @@ impl HaKuzuInner {
         .await
         .map_err(|e| anyhow!("Task panicked: {e}"))??;
 
-        // Journal on success.
+        // Journal the rewritten query + merged params (not the original).
         if let Some(tx) = self.get_journal_sender() {
-            let gs_params = match params {
+            let gs_params = match &merged_params {
                 Some(p) => values::json_params_to_graphstream(p),
                 None => vec![],
             };
             let entry = PendingEntry {
-                query: cypher.to_string(),
+                query: rewrite.query,
                 params: gs_params,
             };
             if tx.send(JournalCommand::Write(entry)).is_err() {
@@ -440,7 +456,7 @@ impl HaKuzu {
                 .unwrap_or("db")
                 .to_string(),
             role: AtomicU8::new(ROLE_LEADER),
-            write_mutex: tokio::sync::Mutex::new(()),
+            write_mutex: Arc::new(tokio::sync::Mutex::new(())),
             read_semaphore: tokio::sync::Semaphore::new(16),
             snapshot_lock: Arc::new(std::sync::RwLock::new(())),
             journal_sender: RwLock::new(None),
@@ -509,6 +525,7 @@ impl HaKuzu {
             forward_timeout,
             secret,
             None, // no snapshot config via from_coordinator
+            None, // no pre-created locks
         )
         .await
     }
@@ -737,6 +754,7 @@ async fn open_with_coordinator(
     forward_timeout: Duration,
     secret: Option<String>,
     snapshot_ctx: Option<SnapshotContext>,
+    locks: Option<(Arc<tokio::sync::Mutex<()>>, Arc<std::sync::RwLock<()>>)>,
 ) -> Result<HaKuzu> {
     // Subscribe to role events BEFORE join.
     let role_rx = coordinator.role_events();
@@ -757,6 +775,15 @@ async fn open_with_coordinator(
         .timeout(forward_timeout)
         .build()?;
 
+    // Use pre-created locks if provided (shared with follower_behavior),
+    // otherwise create new ones.
+    let (write_mutex, snapshot_lock) = locks.unwrap_or_else(|| {
+        (
+            Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(std::sync::RwLock::new(())),
+        )
+    });
+
     let inner = Arc::new(HaKuzuInner {
         coordinator: Some(coordinator),
         replicator: Some(replicator.clone()),
@@ -766,9 +793,9 @@ async fn open_with_coordinator(
             Role::Leader => ROLE_LEADER,
             Role::Follower => ROLE_FOLLOWER,
         }),
-        write_mutex: tokio::sync::Mutex::new(()),
+        write_mutex,
         read_semaphore: tokio::sync::Semaphore::new(16),
-        snapshot_lock: Arc::new(std::sync::RwLock::new(())),
+        snapshot_lock,
         journal_sender: RwLock::new(None),
         leader_address: RwLock::new(leader_addr),
         http_client,

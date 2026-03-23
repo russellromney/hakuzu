@@ -4,7 +4,7 @@
 //! Over-journaling reads is harmless; missing mutations would be catastrophic.
 
 const MUTATION_KEYWORDS: &[&str] = &[
-    "CREATE", "MERGE", "DELETE", "DROP", "ALTER", "COPY", "SET",
+    "CREATE", "MERGE", "DELETE", "DROP", "ALTER", "COPY", "SET", "REMOVE",
     "INSTALL", "UNINSTALL", "IMPORT", "ATTACH", "DETACH",
 ];
 
@@ -83,6 +83,11 @@ mod tests {
     #[test]
     fn test_create_node_table_is_mutation() {
         assert!(is_mutation("CREATE NODE TABLE Person(id INT64, PRIMARY KEY(id))"));
+    }
+
+    #[test]
+    fn test_remove_is_mutation() {
+        assert!(is_mutation("MATCH (n:Person) REMOVE n.age"));
     }
 
     #[test]

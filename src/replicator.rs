@@ -158,7 +158,11 @@ impl Replicator for KuzuReplicator {
                 tracing::info!("KuzuReplicator: pulled {} journal segments for '{}'", segments.len(), name);
             }
             Err(e) => {
-                tracing::warn!("KuzuReplicator: pull for '{}' failed (will catch up via follower loop): {}", name, e);
+                // Log at error level but don't fail — follower loop will catch up.
+                // Pull is called during coordinator.join() for followers; failing here
+                // would prevent the follower from starting at all. The follower's
+                // run_follower_loop will retry the download.
+                tracing::error!("KuzuReplicator: pull for '{}' failed (follower loop will retry): {}", name, e);
             }
         }
         Ok(())

@@ -24,6 +24,7 @@ pub mod metrics;
 pub mod mutation;
 pub mod replay;
 pub mod replicator;
+pub mod rewriter;
 pub mod snapshot;
 mod snapshot_loop;
 pub mod values;
@@ -43,4 +44,4 @@ pub use hadb::{
 };
 
 // Re-export hadb-s3 implementations.
-pub use hadb_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};
+pub use hadb_lease_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};

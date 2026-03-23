@@ -34,7 +34,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use hadb::{Coordinator, CoordinatorConfig, LeaseConfig, Role, RoleEvent};
-use hadb_s3::S3LeaseStore;
+use hadb_lease_s3::S3LeaseStore;
 use hakuzu::KuzuFollowerBehavior;
 use hakuzu::KuzuReplicator;
 

@@ -21,11 +21,16 @@ use crate::replay;
 /// Kuzu-specific follower behavior.
 ///
 /// Tracks journal sequence numbers for incremental journal replication
-/// using graphstream.
+/// using graphstream. Holds write_mutex + snapshot_lock during replay
+/// to prevent concurrent reads from seeing partial replay state.
 pub struct KuzuFollowerBehavior {
     s3_client: aws_sdk_s3::Client,
     bucket: String,
     shared_db: Option<Arc<lbug::Database>>,
+    /// Write mutex — held during replay to serialize with leader writes.
+    write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
+    /// Snapshot lock — held (read) during replay to prevent snapshots mid-replay.
+    snapshot_lock: Option<Arc<std::sync::RwLock<()>>>,
 }
 
 impl KuzuFollowerBehavior {
@@ -34,6 +39,8 @@ impl KuzuFollowerBehavior {
             s3_client,
             bucket,
             shared_db: None,
+            write_mutex: None,
+            snapshot_lock: None,
         }
     }
 
@@ -43,6 +50,17 @@ impl KuzuFollowerBehavior {
     /// Without this, two Database instances on the same file would conflict.
     pub fn with_shared_db(mut self, db: Arc<lbug::Database>) -> Self {
         self.shared_db = Some(db);
+        self
+    }
+
+    /// Set the write mutex and snapshot lock for replay serialization.
+    pub fn with_locks(
+        mut self,
+        write_mutex: Arc<tokio::sync::Mutex<()>>,
+        snapshot_lock: Arc<std::sync::RwLock<()>>,
+    ) -> Self {
+        self.write_mutex = Some(write_mutex);
+        self.snapshot_lock = Some(snapshot_lock);
         self
     }
 }
@@ -84,10 +102,20 @@ impl FollowerBehavior for KuzuFollowerBehavior {
                         }
                         Ok(_segments) => {
                             // 2. Replay entries against local Kuzu.
+                            // Hold write_mutex + snapshot_lock during replay to prevent
+                            // concurrent reads from seeing partial replay state.
+                            let _write_guard = match &self.write_mutex {
+                                Some(m) => Some(m.lock().await),
+                                None => None,
+                            };
                             let journal_dir_clone = journal_dir.clone();
                             let db_path_clone = db_path.clone();
                             let shared_db_clone = self.shared_db.clone();
+                            let snapshot_lock_clone = self.snapshot_lock.clone();
                             let replay_result = tokio::task::spawn_blocking(move || {
+                                let _snap = snapshot_lock_clone
+                                    .as_ref()
+                                    .map(|l| l.read().unwrap_or_else(|e| e.into_inner()));
                                 if let Some(db) = shared_db_clone {
                                     let conn = lbug::Connection::new(&*db)
                                         .map_err(|e| format!("Connection failed: {e}"))?;
@@ -164,11 +192,19 @@ impl FollowerBehavior for KuzuFollowerBehavior {
         .await
         .map_err(|e| anyhow::anyhow!("Catchup download failed: {e}"))?;
 
-        // Replay entries.
+        // Replay entries — hold locks during catchup to prevent partial state.
+        let _write_guard = match &self.write_mutex {
+            Some(m) => Some(m.lock().await),
+            None => None,
+        };
         let journal_dir_clone = journal_dir.clone();
         let db_path_clone = db_path.clone();
         let shared_db_clone = self.shared_db.clone();
+        let snapshot_lock_clone = self.snapshot_lock.clone();
         let new_seq = tokio::task::spawn_blocking(move || {
+            let _snap = snapshot_lock_clone
+                .as_ref()
+                .map(|l| l.read().unwrap_or_else(|e| e.into_inner()));
             if let Some(db) = shared_db_clone {
                 let conn = lbug::Connection::new(&*db)
                     .map_err(|e| format!("Connection failed: {e}"))?;

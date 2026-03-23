@@ -8,7 +8,7 @@ use std::path::Path;
 
 use graphstream::journal::JournalReader;
 use graphstream::types::{map_entries_to_param_values, ParamValue};
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Replay journal entries from `since_seq` forward against a Kuzu database.
 ///
@@ -39,8 +39,13 @@ pub fn replay_entries(
                 last_seq = entry.sequence;
             }
             Err(e) => {
-                warn!("Skipping entry seq={}: {}", entry.sequence, e);
-                last_seq = entry.sequence;
+                // Abort the transaction — a failed replay entry means the follower
+                // would diverge from the leader. Fail fast so the caller can retry.
+                let _ = conn.query("ROLLBACK");
+                return Err(format!(
+                    "Replay failed at seq={}: {e}",
+                    entry.sequence
+                ));
             }
         }
     }

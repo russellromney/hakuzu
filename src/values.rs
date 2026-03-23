@@ -131,7 +131,9 @@ pub fn json_to_lbug(v: &Value) -> Result<lbug::Value, String> {
                 .unwrap_or(lbug::LogicalType::Any);
             Ok(lbug::Value::List(elem_type, items))
         }
-        Value::Object(_) => Err("Object params not supported — use primitive types".into()),
+        Value::Object(_) => Ok(lbug::Value::String(
+            serde_json::to_string(v).map_err(|e| format!("JSON serialize failed: {e}"))?,
+        )),
     }
 }
 
@@ -164,14 +166,16 @@ fn json_to_param_value(v: &Value) -> ParamValue {
             if let Some(i) = n.as_i64() {
                 ParamValue::Int(i)
             } else if let Some(f) = n.as_f64() {
+                // Covers u64 > i64::MAX — may lose precision for very large integers
                 ParamValue::Float(f)
             } else {
-                ParamValue::Null
+                // Should be unreachable — serde_json numbers are always i64, u64, or f64
+                ParamValue::String(n.to_string())
             }
         }
         Value::String(s) => ParamValue::String(s.clone()),
         Value::Array(arr) => ParamValue::List(arr.iter().map(json_to_param_value).collect()),
-        Value::Object(_) => ParamValue::Null, // graphstream doesn't support map params
+        Value::Object(_) => ParamValue::String(serde_json::to_string(v).expect("JSON object must serialize")),
     }
 }
 
@@ -184,5 +188,231 @@ fn lbug_value_logical_type(v: &lbug::Value) -> lbug::LogicalType {
         lbug::Value::Float(_) => lbug::LogicalType::Float,
         lbug::Value::String(_) => lbug::LogicalType::String,
         _ => lbug::LogicalType::Any,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- json_to_lbug ---
+
+    #[test]
+    fn test_json_to_lbug_null() {
+        assert!(matches!(json_to_lbug(&Value::Null).unwrap(), lbug::Value::Null(_)));
+    }
+
+    #[test]
+    fn test_json_to_lbug_bool() {
+        assert!(matches!(json_to_lbug(&json!(true)).unwrap(), lbug::Value::Bool(true)));
+        assert!(matches!(json_to_lbug(&json!(false)).unwrap(), lbug::Value::Bool(false)));
+    }
+
+    #[test]
+    fn test_json_to_lbug_int() {
+        match json_to_lbug(&json!(42)).unwrap() {
+            lbug::Value::Int64(n) => assert_eq!(n, 42),
+            other => panic!("Expected Int64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_to_lbug_negative_int() {
+        match json_to_lbug(&json!(-100)).unwrap() {
+            lbug::Value::Int64(n) => assert_eq!(n, -100),
+            other => panic!("Expected Int64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_to_lbug_large_u64() {
+        // u64::MAX cannot fit in i64, should become UInt64
+        let val = json!(u64::MAX);
+        match json_to_lbug(&val).unwrap() {
+            lbug::Value::UInt64(n) => assert_eq!(n, u64::MAX),
+            other => panic!("Expected UInt64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_to_lbug_float() {
+        match json_to_lbug(&json!(3.14)).unwrap() {
+            lbug::Value::Double(f) => assert!((f - 3.14).abs() < 1e-10),
+            other => panic!("Expected Double, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_to_lbug_string() {
+        match json_to_lbug(&json!("hello")).unwrap() {
+            lbug::Value::String(s) => assert_eq!(s, "hello"),
+            other => panic!("Expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_to_lbug_array() {
+        let val = json!([1, 2, 3]);
+        match json_to_lbug(&val).unwrap() {
+            lbug::Value::List(_, items) => assert_eq!(items.len(), 3),
+            other => panic!("Expected List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_to_lbug_object_becomes_string() {
+        let val = json!({"key": "value"});
+        match json_to_lbug(&val).unwrap() {
+            lbug::Value::String(s) => {
+                let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+                assert_eq!(parsed["key"], "value");
+            }
+            other => panic!("Expected String (serialized JSON), got {:?}", other),
+        }
+    }
+
+    // --- json_to_param_value ---
+
+    #[test]
+    fn test_param_value_null() {
+        assert!(matches!(json_to_param_value(&Value::Null), ParamValue::Null));
+    }
+
+    #[test]
+    fn test_param_value_bool() {
+        assert!(matches!(json_to_param_value(&json!(true)), ParamValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_param_value_int() {
+        match json_to_param_value(&json!(42)) {
+            ParamValue::Int(n) => assert_eq!(n, 42),
+            other => panic!("Expected Int, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_param_value_large_u64_becomes_float() {
+        // u64::MAX can't fit in i64 → falls through to f64
+        let val = json!(u64::MAX);
+        match json_to_param_value(&val) {
+            ParamValue::Float(f) => assert!(f > 0.0),
+            other => panic!("Expected Float for large u64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_param_value_float() {
+        match json_to_param_value(&json!(3.14)) {
+            ParamValue::Float(f) => assert!((f - 3.14).abs() < 1e-10),
+            other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_param_value_string() {
+        match json_to_param_value(&json!("hello")) {
+            ParamValue::String(s) => assert_eq!(s, "hello"),
+            other => panic!("Expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_param_value_array() {
+        let val = json!([1, 2]);
+        match json_to_param_value(&val) {
+            ParamValue::List(items) => assert_eq!(items.len(), 2),
+            other => panic!("Expected List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_param_value_object_becomes_json_string() {
+        let val = json!({"nested": true});
+        match json_to_param_value(&val) {
+            ParamValue::String(s) => {
+                let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+                assert_eq!(parsed["nested"], true);
+            }
+            other => panic!("Expected String (serialized JSON), got {:?}", other),
+        }
+    }
+
+    // --- json_params_to_lbug ---
+
+    #[test]
+    fn test_json_params_to_lbug_basic() {
+        let params = json!({"name": "Alice", "age": 30});
+        let result = json_params_to_lbug(&params).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_json_params_to_lbug_not_object_fails() {
+        let result = json_params_to_lbug(&json!("not an object"));
+        assert!(result.is_err());
+    }
+
+    // --- json_params_to_graphstream ---
+
+    #[test]
+    fn test_json_params_to_graphstream_basic() {
+        let params = json!({"name": "Alice"});
+        let result = json_params_to_graphstream(&params);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "name");
+    }
+
+    #[test]
+    fn test_json_params_to_graphstream_not_object_returns_empty() {
+        let result = json_params_to_graphstream(&json!(42));
+        assert!(result.is_empty());
+    }
+
+    // --- lbug_to_json ---
+
+    #[test]
+    fn test_lbug_to_json_null() {
+        assert_eq!(lbug_to_json(&lbug::Value::Null(lbug::LogicalType::Any)), Value::Null);
+    }
+
+    #[test]
+    fn test_lbug_to_json_bool() {
+        assert_eq!(lbug_to_json(&lbug::Value::Bool(true)), json!(true));
+    }
+
+    #[test]
+    fn test_lbug_to_json_int64() {
+        assert_eq!(lbug_to_json(&lbug::Value::Int64(42)), json!(42));
+    }
+
+    #[test]
+    fn test_lbug_to_json_double() {
+        assert_eq!(lbug_to_json(&lbug::Value::Double(3.14)), json!(3.14));
+    }
+
+    #[test]
+    fn test_lbug_to_json_string() {
+        assert_eq!(lbug_to_json(&lbug::Value::String("hello".into())), json!("hello"));
+    }
+
+    #[test]
+    fn test_lbug_to_json_uint64_small() {
+        assert_eq!(lbug_to_json(&lbug::Value::UInt64(100)), json!(100));
+    }
+
+    #[test]
+    fn test_lbug_to_json_uint64_large() {
+        let val = lbug_to_json(&lbug::Value::UInt64(u64::MAX));
+        assert_eq!(val, json!(u64::MAX.to_string()));
+    }
+
+    #[test]
+    fn test_lbug_to_json_list() {
+        let list = lbug::Value::List(
+            lbug::LogicalType::Int64,
+            vec![lbug::Value::Int64(1), lbug::Value::Int64(2)],
+        );
+        assert_eq!(lbug_to_json(&list), json!([1, 2]));
     }
 }
