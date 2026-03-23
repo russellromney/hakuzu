@@ -1,5 +1,40 @@
 # hakuzu Changelog
 
+## Phase 5: Operational Resilience + Observability
+
+### Prometheus metrics
+`HakuzuMetrics` — lock-free `AtomicU64` counters following hadb's pattern.
+
+Counters: `writes_total`, `writes_forwarded`, `reads_total`, `forwarding_errors`
+Gauges: `last_write_duration_us`, `last_read_duration_us`, `journal_sequence`
+
+API: `snapshot()` → `HakuzuMetricsSnapshot` → `to_prometheus()` text format. Designed to concatenate with hadb + graphstream metrics for a single `/metrics` endpoint.
+
+Tests (4 unit): `test_metrics_default_zero`, `test_metrics_increment`, `test_metrics_snapshot`, `test_metrics_prometheus_format`
+
+Files: `src/metrics.rs`, `src/lib.rs`
+
+### Snapshot staging cleanup
+Fixed snapshot cleanup on ALL error paths in `run_snapshot_loop()` — previously only cleaned staging dir on success, leaving orphaned `snapshots_tmp/` dirs on failure or panic.
+
+Added `cleanup_stale_staging(base_dir, max_age) -> u64` helper for periodic cleanup of staging dirs older than configurable max age.
+
+Tests (3 unit): `test_cleanup_stale_staging_removes_old_dir`, `test_cleanup_stale_staging_keeps_recent_dir`, `test_cleanup_stale_staging_nonexistent`
+
+Files: `src/database.rs`, `src/snapshot.rs`
+
+### RSS profiling tools
+- `src/bin/rss_bench.rs` — opens local HaKuzu, writes batches (1K/5K/10K), queries, idles, prints STAGE markers
+- `bench/measure_rss.py` — launches rss_bench, samples RSS via `ps -o rss=`, correlates with stage markers. Catches regressions like walrust's 70MB→20MB fix.
+
+### Connection pool investigation
+`bench/connection_cost.rs` — benchmarks `lbug::Connection` creation cost (10K iterations). Reports avg/p50/p95/p99 and recommends pool or not based on results.
+
+### Read semaphore tuning
+`bench/semaphore_tuning.rs` — benchmarks read latency with 32 concurrent readers at semaphore values 8/16/32/64, reports avg/p50/p95/p99 for each.
+
+Files: `Cargo.toml` ([[bin]] + [[example]] entries)
+
 ## Phase 4: Structured Error Types
 
 Public API methods (`execute`, `query`, `handoff`, `close`) now return `crate::error::Result<T>` with `HakuzuError` enum instead of `anyhow::Result`. Consumers can match on specific failure modes:

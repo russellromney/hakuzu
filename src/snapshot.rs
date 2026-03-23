@@ -292,6 +292,62 @@ fn parse_snapshot_seq(key: &str) -> Option<u64> {
     num.parse().ok()
 }
 
+/// Clean up stale snapshot staging directories older than max_age.
+/// Returns the number of bytes freed.
+pub fn cleanup_stale_staging(base_dir: &Path, max_age: std::time::Duration) -> u64 {
+    let staging_dir = base_dir.join("snapshots_tmp");
+    if !staging_dir.exists() {
+        return 0;
+    }
+
+    let modified = match std::fs::metadata(&staging_dir).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+
+    let age = std::time::SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+
+    if age <= max_age {
+        return 0;
+    }
+
+    // Calculate total size.
+    let bytes = dir_size(&staging_dir);
+
+    match std::fs::remove_dir_all(&staging_dir) {
+        Ok(()) => {
+            tracing::info!(
+                path = %staging_dir.display(),
+                age_secs = age.as_secs(),
+                bytes_freed = bytes,
+                "Cleaned up stale snapshot staging dir"
+            );
+            bytes
+        }
+        Err(e) => {
+            tracing::error!("Failed to clean stale staging dir {}: {e}", staging_dir.display());
+            0
+        }
+    }
+}
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                total += dir_size(&path);
+            } else if let Ok(meta) = std::fs::metadata(&path) {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +660,45 @@ mod tests {
                 format!("content_{}", i)
             );
         }
+    }
+
+    #[test]
+    fn test_cleanup_stale_staging_removes_old_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("snapshots_tmp");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("snapshot.tar.zst"), vec![0u8; 1000]).unwrap();
+
+        // Set mtime to 2 hours ago.
+        let two_hours_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        filetime::set_file_mtime(
+            &staging,
+            filetime::FileTime::from_system_time(two_hours_ago),
+        )
+        .unwrap();
+
+        let freed = cleanup_stale_staging(dir.path(), std::time::Duration::from_secs(3600));
+        assert!(freed >= 1000, "Should free at least 1000 bytes, got {freed}");
+        assert!(!staging.exists(), "Staging dir should be removed");
+    }
+
+    #[test]
+    fn test_cleanup_stale_staging_keeps_recent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("snapshots_tmp");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("snapshot.tar.zst"), b"data").unwrap();
+
+        let freed = cleanup_stale_staging(dir.path(), std::time::Duration::from_secs(3600));
+        assert_eq!(freed, 0);
+        assert!(staging.exists(), "Recent staging dir should remain");
+    }
+
+    #[test]
+    fn test_cleanup_stale_staging_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let freed = cleanup_stale_staging(dir.path(), std::time::Duration::from_secs(3600));
+        assert_eq!(freed, 0);
     }
 }

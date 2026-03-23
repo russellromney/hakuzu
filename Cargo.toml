@@ -52,6 +52,9 @@ hex = "0.4"
 hostname = "0.4"
 uuid = { version = "1", features = ["v4"] }
 
+# Temp dirs (for bench binaries)
+tempfile = "3"
+
 # Memory allocator — returns freed memory to OS (macOS system allocator doesn't)
 mimalloc = { version = "0.1", default-features = false }
 
@@ -63,12 +66,25 @@ path = "src/bin/ha_experiment.rs"
 name = "hakuzu-ha-writer"
 path = "src/bin/ha_writer.rs"
 
+[[bin]]
+name = "rss-bench"
+path = "src/bin/rss_bench.rs"
+
+[[example]]
+name = "connection_cost"
+path = "bench/connection_cost.rs"
+
+[[example]]
+name = "semaphore_tuning"
+path = "bench/semaphore_tuning.rs"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 serde_json = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
+filetime = "0.2"
 
 [patch.crates-io]
 lbug = { path = "../personal-website/ladybug-fork/tools/rust_api" }

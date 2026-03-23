@@ -20,15 +20,18 @@ pub mod database;
 pub mod error;
 pub mod follower_behavior;
 pub mod forwarding;
+pub mod metrics;
 pub mod mutation;
 pub mod replay;
 pub mod replicator;
 pub mod snapshot;
+mod snapshot_loop;
 pub mod values;
 
 // Primary API.
 pub use database::{HaKuzu, HaKuzuBuilder, QueryResult, SnapshotConfig};
 pub use error::HakuzuError;
+pub use metrics::HakuzuMetrics;
 pub use snapshot::SnapshotMeta;
 pub use replicator::KuzuReplicator;
 pub use follower_behavior::KuzuFollowerBehavior;
