@@ -1,0 +1,62 @@
+[package]
+name = "hakuzu"
+version = "0.1.0"
+edition = "2021"
+description = "HA Kuzu/LadybugDB with one line of code. Leader election, journal replication, write forwarding — just your app + an S3 bucket."
+authors = ["Russell Romney <russellromney@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/russellromney/hakuzu"
+keywords = ["kuzu", "graph-database", "ha", "replication", "leader-election"]
+categories = ["database", "network-programming"]
+
+[dependencies]
+# HA coordination framework
+hadb = { path = "../hadb/hadb" }
+hadb-s3 = { path = "../hadb/hadb-s3" }
+
+# Journal replication
+graphstream = { path = "../graphstream" }
+
+# Kuzu graph database
+lbug = { version = "0.14", default-features = false }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# S3
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP (write forwarding + experiment binaries)
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+
+# CLI + logging (for experiment binaries)
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Hostname
+hostname = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+[[bin]]
+name = "hakuzu-ha-experiment"
+path = "src/bin/ha_experiment.rs"
+
+[[bin]]
+name = "hakuzu-ha-writer"
+path = "src/bin/ha_writer.rs"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[patch.crates-io]
+lbug = { path = "../personal-website/ladybug-fork/tools/rust_api" }
