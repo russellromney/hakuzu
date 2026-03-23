@@ -27,15 +27,6 @@ Default read_semaphore is 16. This was inherited from graphd-engine without benc
 
 Any disk-based cache (snapshot staging, journal segment cache) needs a periodic cleanup timer. walrust v0.6.0 learned this the hard way — shadow mode had a cache but no cleanup, leading to unbounded growth. Pattern: 5-minute `tokio::time::interval` in the main select loop, applying retention duration + max size limits. Add this to any mode that caches journal segments or snapshots locally.
 
-### Structured error types
-
-Currently returns `anyhow::Result` everywhere. For a library API, callers need to match on error kinds:
-- `LeaderUnavailable` — write forwarding failed, leader unreachable
-- `NotLeader` — tried to execute write locally but not leader
-- `DatabaseError` — Kuzu query/execution error
-- `JournalError` — graphstream write failed
-- `CoordinatorError` — hadb lease/join failure
-
 ### Metrics
 
 Export Prometheus metrics beyond coordinator metrics:

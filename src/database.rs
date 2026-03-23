@@ -20,6 +20,7 @@ use graphstream::journal::{JournalCommand, JournalSender, PendingEntry};
 use hadb::{Coordinator, CoordinatorConfig, LeaseConfig, Role, RoleEvent};
 use hadb_s3::S3LeaseStore;
 
+use crate::error::HakuzuError;
 use crate::follower_behavior::KuzuFollowerBehavior;
 use crate::forwarding::{self, ForwardingState};
 use crate::mutation::is_mutation;
@@ -528,7 +529,7 @@ impl HaKuzu {
         &self,
         cypher: &str,
         params: Option<serde_json::Value>,
-    ) -> Result<()> {
+    ) -> crate::error::Result<()> {
         if is_mutation(cypher) {
             let role = self.inner.current_role();
             match role {
@@ -536,6 +537,7 @@ impl HaKuzu {
                     self.inner
                         .execute_write_local(cypher, params.as_ref())
                         .await
+                        .map_err(|e| HakuzuError::DatabaseError(e.to_string()))
                 }
                 Some(Role::Follower) => {
                     self.execute_forwarded(cypher, params.as_ref()).await
@@ -553,13 +555,13 @@ impl HaKuzu {
         &self,
         cypher: &str,
         params: Option<serde_json::Value>,
-    ) -> Result<QueryResult> {
+    ) -> crate::error::Result<QueryResult> {
         let _permit = self
             .inner
             .read_semaphore
             .acquire()
             .await
-            .map_err(|_| anyhow!("Engine closed"))?;
+            .map_err(|_| HakuzuError::EngineClosed)?;
 
         let db = self.inner.db.clone();
         let lock = self.inner.snapshot_lock.clone();
@@ -568,22 +570,22 @@ impl HaKuzu {
 
         tokio::task::spawn_blocking(move || {
             let conn = lbug::Connection::new(&db)
-                .map_err(|e| anyhow!("Failed to create connection: {e}"))?;
+                .map_err(|e| HakuzuError::DatabaseError(format!("Failed to create connection: {e}")))?;
             let _snap = lock.read().unwrap_or_else(|e| e.into_inner());
 
             let mut result = if let Some(ref p) = params_owned {
                 let lbug_params = values::json_params_to_lbug(p)
-                    .map_err(|e| anyhow!("Param conversion failed: {e}"))?;
+                    .map_err(|e| HakuzuError::DatabaseError(format!("Param conversion failed: {e}")))?;
                 let refs: Vec<(&str, lbug::Value)> =
                     lbug_params.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
                 let mut stmt = conn
                     .prepare(&cypher)
-                    .map_err(|e| anyhow!("Prepare failed: {e}"))?;
+                    .map_err(|e| HakuzuError::DatabaseError(format!("Prepare failed: {e}")))?;
                 conn.execute(&mut stmt, refs)
-                    .map_err(|e| anyhow!("Execute failed: {e}"))?
+                    .map_err(|e| HakuzuError::DatabaseError(format!("Execute failed: {e}")))?
             } else {
                 conn.query(&cypher)
-                    .map_err(|e| anyhow!("Query failed: {e}"))?
+                    .map_err(|e| HakuzuError::DatabaseError(format!("Query failed: {e}")))?
             };
 
             let columns = result.get_column_names();
@@ -597,7 +599,7 @@ impl HaKuzu {
             Ok(QueryResult { columns, rows })
         })
         .await
-        .map_err(|e| anyhow!("Task panicked: {e}"))?
+        .map_err(|e| HakuzuError::DatabaseError(format!("Task panicked: {e}")))?
     }
 
     /// Get the current role of this node.
@@ -631,7 +633,7 @@ impl HaKuzu {
     ///    are in a sealed segment ready for upload.
     /// 3. Releases mutex, then delegates to coordinator.handoff() for lease
     ///    release and role demotion.
-    pub async fn handoff(&self) -> Result<bool> {
+    pub async fn handoff(&self) -> crate::error::Result<bool> {
         let coordinator = match &self.inner.coordinator {
             Some(c) => c,
             None => return Ok(false),
@@ -644,15 +646,21 @@ impl HaKuzu {
             // Seal journal segment so all entries are durable before we step down.
             if let Some(ref replicator) = self.inner.replicator {
                 use hadb::Replicator;
-                replicator.sync(&self.inner.db_name).await?;
+                replicator
+                    .sync(&self.inner.db_name)
+                    .await
+                    .map_err(|e| HakuzuError::JournalError(e.to_string()))?;
             }
         } // write_mutex released — coordinator handoff may take time
 
-        coordinator.handoff(&self.inner.db_name).await
+        coordinator
+            .handoff(&self.inner.db_name)
+            .await
+            .map_err(|e| HakuzuError::CoordinatorError(e.to_string()))
     }
 
     /// Cleanly shut down: drain writes, seal journal, leave cluster, stop tasks.
-    pub async fn close(self) -> Result<()> {
+    pub async fn close(self) -> crate::error::Result<()> {
         if let Some(ref coordinator) = self.inner.coordinator {
             // Drain: wait for in-flight writes + seal journal before leaving.
             {
@@ -664,7 +672,10 @@ impl HaKuzu {
                     }
                 }
             }
-            coordinator.leave(&self.inner.db_name).await?;
+            coordinator
+                .leave(&self.inner.db_name)
+                .await
+                .map_err(|e| HakuzuError::CoordinatorError(e.to_string()))?;
         }
 
         self._fwd_handle.abort();
@@ -687,12 +698,10 @@ impl HaKuzu {
         &self,
         cypher: &str,
         params: Option<&serde_json::Value>,
-    ) -> Result<()> {
+    ) -> crate::error::Result<()> {
         let leader_addr = self.inner.leader_addr();
         if leader_addr.is_empty() {
-            return Err(anyhow!(
-                "No leader address available — cannot forward write"
-            ));
+            return Err(HakuzuError::NotLeader);
         }
 
         let url = format!("{}/hakuzu/execute", leader_addr);
@@ -705,17 +714,16 @@ impl HaKuzu {
         if let Some(ref secret) = self.inner.secret {
             req = req.bearer_auth(secret);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| anyhow!("Failed to forward write to leader: {}", e))?;
+        let resp = req.send().await.map_err(|e| {
+            HakuzuError::LeaderUnavailable(format!("Failed to forward write: {e}"))
+        })?;
 
         if !resp.status().is_success() {
-            return Err(anyhow!(
+            return Err(HakuzuError::LeaderUnavailable(format!(
                 "Leader returned error: {} {}",
                 resp.status(),
                 resp.text().await.unwrap_or_default()
-            ));
+            )));
         }
 
         Ok(())

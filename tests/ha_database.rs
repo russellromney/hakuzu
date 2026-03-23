@@ -9,7 +9,7 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use hakuzu::{
-    Coordinator, CoordinatorConfig, HaKuzu, InMemoryLeaseStore, KuzuFollowerBehavior,
+    Coordinator, CoordinatorConfig, HaKuzu, HakuzuError, InMemoryLeaseStore, KuzuFollowerBehavior,
     KuzuReplicator, LeaseConfig, Role,
 };
 
@@ -376,7 +376,7 @@ async fn auth_rejects_wrong_secret() {
     // Wait for follower to see the leader.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Write through follower should fail (wrong secret).
+    // Write through follower should fail (wrong secret) with LeaderUnavailable.
     let result = follower
         .execute(
             "CREATE (:Person {id: $id, name: $name})",
@@ -384,6 +384,10 @@ async fn auth_rejects_wrong_secret() {
         )
         .await;
     assert!(result.is_err(), "Should reject wrong secret: {:?}", result);
+    assert!(
+        matches!(result.unwrap_err(), HakuzuError::LeaderUnavailable(_)),
+        "Should be LeaderUnavailable error"
+    );
 
     leader.close().await.unwrap();
     follower.close().await.unwrap();

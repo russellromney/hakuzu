@@ -15,13 +15,14 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use graphstream::journal::{self, JournalCommand, JournalSender, JournalState};
-use graphstream::uploader::spawn_journal_uploader;
+use graphstream::uploader::{spawn_journal_uploader, UploadMessage};
 use hadb::Replicator;
 
 /// Per-database replication state.
 struct KuzuDbState {
     journal_tx: JournalSender,
     journal_state: Arc<JournalState>,
+    upload_tx: tokio::sync::mpsc::Sender<UploadMessage>,
     uploader_handle: JoinHandle<()>,
     uploader_shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -111,10 +112,10 @@ impl Replicator for KuzuReplicator {
             state.clone(),
         );
 
-        // Spawn S3 uploader.
+        // Spawn S3 uploader (concurrent, returns sender + handle).
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let db_prefix = format!("{}{}/", self.prefix, name);
-        let uploader_handle = spawn_journal_uploader(
+        let (upload_tx, uploader_handle) = spawn_journal_uploader(
             journal_tx.clone(),
             journal_dir,
             self.bucket.clone(),
@@ -126,6 +127,7 @@ impl Replicator for KuzuReplicator {
         let db_state = KuzuDbState {
             journal_tx,
             journal_state: state,
+            upload_tx,
             uploader_handle,
             uploader_shutdown: shutdown_tx,
         };
@@ -164,7 +166,7 @@ impl Replicator for KuzuReplicator {
 
     async fn remove(&self, name: &str) -> Result<()> {
         if let Some(state) = self.databases.lock().await.remove(name) {
-            // Signal uploader shutdown.
+            // Signal uploader shutdown via watch (stops seal timer loop).
             let _ = state.uploader_shutdown.send(true);
 
             // Send journal shutdown.
@@ -174,7 +176,7 @@ impl Replicator for KuzuReplicator {
             })
             .await?;
 
-            // Wait for uploader to finish.
+            // Wait for uploader to finish (drains in-flight uploads).
             let _ = state.uploader_handle.await;
 
             tracing::info!("KuzuReplicator: removed database '{}'", name);
@@ -197,8 +199,12 @@ impl Replicator for KuzuReplicator {
             })
             .await?;
 
-            if let Some(path) = sealed {
+            if let Some(path) = &sealed {
                 tracing::info!("KuzuReplicator: synced (sealed {})", path.display());
+                // Trigger immediate upload of the sealed segment.
+                if state.upload_tx.send(UploadMessage::Upload(path.clone())).await.is_err() {
+                    tracing::error!("KuzuReplicator: upload channel closed for '{}'", name);
+                }
             }
         }
 

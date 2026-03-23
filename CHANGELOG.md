@@ -1,5 +1,26 @@
 # hakuzu Changelog
 
+## Phase 4: Structured Error Types
+
+Public API methods (`execute`, `query`, `handoff`, `close`) now return `crate::error::Result<T>` with `HakuzuError` enum instead of `anyhow::Result`. Consumers can match on specific failure modes:
+
+- `HakuzuError::LeaderUnavailable(msg)` — write forwarding failed, leader unreachable or returned error
+- `HakuzuError::NotLeader` — follower has no leader address for forwarding
+- `HakuzuError::DatabaseError(msg)` — Kuzu query, prepare, execute, or connection error
+- `HakuzuError::JournalError(msg)` — graphstream write, seal, or replication error
+- `HakuzuError::CoordinatorError(msg)` — hadb lease, join, leave, or handoff error
+- `HakuzuError::EngineClosed` — semaphore closed, engine shut down
+
+Internal methods and `open()` still use `anyhow::Result` since setup errors are one-time and don't need matching.
+
+### Files
+- `src/error.rs` — `HakuzuError` enum, `Display`, `Error`, `From<anyhow::Error>`, `Result<T>` type alias
+- `src/database.rs` — `execute()`, `query()`, `handoff()`, `close()`, `execute_forwarded()` updated
+- `src/lib.rs` — re-exports `HakuzuError`
+
+### Tests (10 unit)
+- Display for all 6 variants, Error trait, From<anyhow>, Result alias, exhaustive match
+
 ## Phase 3: Production Hardening
 
 Five-step production hardening across graphstream and hakuzu.
