@@ -149,6 +149,10 @@ impl FollowerBehavior for KuzuFollowerBehavior {
         let journal_dir = db_path.parent().unwrap_or(db_path.as_path()).join("journal");
         let db_prefix = format!("{}{}/", prefix, db_name);
 
+        // Note: snapshot-based bootstrap happens in HaKuzuBuilder::open() on cold
+        // start. Here the database is already open, so we can only replay journal
+        // entries. The snapshot accelerates cold start, not promotion catchup.
+
         // Download latest segments.
         graphstream::download_new_segments(
             &self.s3_client,

@@ -1,96 +1,48 @@
 # hakuzu Roadmap
 
-## Phase 1: Comprehensive Tests
+## Phase 3: Operational Resilience (remaining)
 
-### graphstream test expansion
-- Writer lifecycle: `is_alive()` false after shutdown, flush with no pending writes
-- Seal edge cases: seal empty segment (no writes), multiple consecutive seals, seal-then-write
-- Encrypted segment round-trip: write with key, read with key, wrong key fails
-- Reader edge cases: nonexistent dir, from_sequence beyond last entry, empty journal dir
-- Compact edge cases: single input, compact with encryption
-- ParamValue edge cases: nested lists, empty lists, extreme values (i64::MAX, NaN)
-- Large entries: entries exceeding segment size trigger correct rotation
-- Chain hash validation: verify hashes chain correctly across segments
+### RSS profiling tools
 
-### hakuzu test expansion
-- Replay edge cases: empty journal returns since_seq, invalid query is skipped (warn, not fail), typed parameter binding with prepared statements
-- Replicator builder: verify `with_segment_max_bytes`, `with_fsync_ms`, `with_upload_interval` apply correctly
-- Replicator sync: seal current segment via `sync()`, sync with no pending data
-- Replicator multi-db: add multiple databases, write to each, remove individually
-- Replicator idempotency: add same name twice, remove nonexistent name
-- Replicator journal access: `journal_sender`/`journal_state` return None for unknown names
-- Replay across segments: write enough entries to trigger rotation, replay all from follower
+Port walrust's `bench/measure_rss.py` pattern to hakuzu. Measure RSS at each stage:
+- After Kuzu DB open + schema apply
+- After coordinator join + role assignment
+- After N write batches (varying batch sizes)
+- After follower journal replay
+- Idle after load
 
-## Phase 2: HaKuzu Production Library API
+This catches regressions like walrust's 70MB→20MB fix. Keep the profiler in `bench/` permanently.
 
-HaKuzu needs to be what HaQLite is for SQLite — embed in one line, get HA automatically. Currently all HA logic is manual wiring in the 490-line ha_experiment.rs binary. The library API encapsulates everything.
+### Connection pool investigation
 
-### Target API
+Currently creates a new `lbug::Connection` per operation inside `spawn_blocking` because Connection is not Send. Profile whether connection creation is a measurable cost under load. If so, investigate per-thread connection caching via `thread_local!`.
 
-```rust
-use hakuzu::{HaKuzu, QueryResult};
+### Read semaphore tuning
 
-// HA mode
-let db = HaKuzu::builder("my-bucket")
-    .prefix("myapp/")
-    .secret("my-token")
-    .open("/data/graph", "CREATE NODE TABLE IF NOT EXISTS Person(id INT64, name STRING, PRIMARY KEY(id))")
-    .await?;
+Default read_semaphore is 16. This was inherited from graphd-engine without benchmarking in hakuzu's context. Profile read latency under concurrent load with different semaphore values (8, 16, 32, 64) to find the sweet spot for Kuzu's MVCC reader.
 
-// Writes — leader executes + journals; follower auto-forwards
-db.execute("CREATE (p:Person {id: $id, name: $name})", Some(json!({"id": 1, "name": "Alice"}))).await?;
+## Phase 4: Production Hardening (remaining)
 
-// Reads — always local
-let result: QueryResult = db.query("MATCH (p:Person) RETURN p.id, p.name", None).await?;
+### Cache cleanup timer
 
-// Local mode — no S3, no HA
-let db = HaKuzu::local("/data/graph", "CREATE NODE TABLE IF NOT EXISTS ...")?;
-```
+Any disk-based cache (snapshot staging, journal segment cache) needs a periodic cleanup timer. walrust v0.6.0 learned this the hard way — shadow mode had a cache but no cleanup, leading to unbounded growth. Pattern: 5-minute `tokio::time::interval` in the main select loop, applying retention duration + max size limits. Add this to any mode that caches journal segments or snapshots locally.
 
-### New files
+### Structured error types
 
-- `src/mutation.rs` (~55 lines) — `is_mutation()` keyword check for auto-routing reads vs writes. Copied from graphd-engine's proven implementation.
-- `src/values.rs` (~80 lines) — `lbug_to_json()`, `json_to_lbug()`, `json_params_to_graphstream()` value conversions. Pattern from graphd-engine's values.rs.
-- `src/forwarding.rs` (~120 lines) — `ForwardedExecute`, `ExecuteResult`, Bearer auth, `POST /hakuzu/execute` handler. Pattern from haqlite's forwarding.rs.
-- `src/database.rs` (~450 lines) — `HaKuzuBuilder`, `HaKuzu`, `HaKuzuInner`. Builder → open → Coordinator + KuzuReplicator + forwarding server + role listener. Pattern from haqlite's database.rs + graphd-engine's engine.rs.
+Currently returns `anyhow::Result` everywhere. For a library API, callers need to match on error kinds:
+- `LeaderUnavailable` — write forwarding failed, leader unreachable
+- `NotLeader` — tried to execute write locally but not leader
+- `DatabaseError` — Kuzu query/execution error
+- `JournalError` — graphstream write failed
+- `CoordinatorError` — hadb lease/join failure
 
-### Key design (from graphd-engine)
+### Metrics
 
-- **Connection-per-operation**: `lbug::Connection` is NOT Send. Created in `spawn_blocking`, dropped within.
-- **write_mutex**: `tokio::sync::Mutex<()>` serializes writes (Kuzu single-writer).
-- **read_semaphore**: `tokio::sync::Semaphore` bounds concurrent reads.
-- **snapshot_lock**: `Arc<RwLock<()>>` — read for queries, write for CHECKPOINT.
-- **Journal on success**: After successful write, send `PendingEntry` to graphstream `JournalSender`.
-
-### Comprehensive test plan (`tests/ha_database.rs`)
-
-Unit-level tests:
-- `is_mutation()` — verify CREATE, MERGE, DELETE, SET, DROP, ALTER, COPY, MATCH, RETURN, EXPLAIN, PROFILE, CALL, UNWIND
-- `lbug_to_json()` — Null, Bool, Int64, Double, String, List, Date, Timestamp, Node, Rel
-- `json_to_lbug()` — round-trip primitives, invalid types error
-- `json_params_to_graphstream()` — JSON object to `Vec<(String, ParamValue)>`
-
-Integration tests:
-1. **single_node_local_mode** — `HaKuzu::local()`, execute schema + writes, query results, close
-2. **single_node_execute_and_query** — `from_coordinator`, 5 writes, query count, verify all present
-3. **two_node_forwarded_write** — leader + follower, write through follower, verify data reaches leader
-4. **forwarding_error_no_leader** — follower with unreachable leader address, execute returns error
-5. **close_is_clean** — write, close, reopen same path, verify data persists
-6. **auth_rejects_wrong_secret** — wrong Bearer token, forwarded write rejected (401)
-7. **auth_accepts_correct_secret** — matching Bearer token, forwarded write succeeds
-
-E2E regression:
-- `tests/e2e_ha.sh` — all 7 existing HA scenarios continue passing (leader election, failover, recovery, journal replay, multi-node convergence, graceful handoff, writer client)
-
-### Review checklist
-
-- [ ] All `is_mutation()` keywords match graphd-engine's proven list
-- [ ] Connection created + dropped inside `spawn_blocking` (never held across await)
-- [ ] write_mutex acquired before every mutation (no data races)
-- [ ] JournalSender populated on Promoted, cleared on Demoted/Fenced/Sleeping
-- [ ] Forwarding handler checks role == Leader before executing
-- [ ] Bearer auth checked on all forwarding endpoints
-- [ ] `close()` drains coordinator, shuts down replicator, joins all tasks
-- [ ] QueryResult serializes all lbug types correctly (especially Node/Rel)
-- [ ] No panics in public API — all errors returned as `Result`
-- [ ] E2E scenarios still pass after library changes
+Export Prometheus metrics beyond coordinator metrics:
+- `hakuzu_writes_total` (counter, by role: leader/forwarded)
+- `hakuzu_reads_total` (counter)
+- `hakuzu_write_latency_seconds` (histogram)
+- `hakuzu_read_latency_seconds` (histogram)
+- `hakuzu_journal_sequence` (gauge)
+- `hakuzu_follower_lag_entries` (gauge — leader sequence minus follower sequence)
+- `hakuzu_forwarding_errors_total` (counter)

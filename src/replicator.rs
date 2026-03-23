@@ -38,6 +38,8 @@ pub struct KuzuReplicator {
     fsync_ms: u64,
     /// Upload interval (default 10s).
     upload_interval: Duration,
+    /// Optional S3 client for pull(). If None, creates from aws_config defaults.
+    s3_client: Option<aws_sdk_s3::Client>,
     databases: Mutex<HashMap<String, KuzuDbState>>,
 }
 
@@ -49,8 +51,15 @@ impl KuzuReplicator {
             segment_max_bytes: 4 * 1024 * 1024, // 4MB
             fsync_ms: 100,
             upload_interval: Duration::from_secs(10),
+            s3_client: None,
             databases: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Provide an S3 client for pull() operations instead of creating from defaults.
+    pub fn with_s3_client(mut self, client: aws_sdk_s3::Client) -> Self {
+        self.s3_client = Some(client);
+        self
     }
 
     pub fn with_segment_max_bytes(mut self, bytes: u64) -> Self {
@@ -133,15 +142,23 @@ impl Replicator for KuzuReplicator {
             .map_err(|e| anyhow::anyhow!("Failed to create journal dir: {e}"))?;
 
         // Download all journal segments from S3.
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let s3_client = aws_sdk_s3::Client::new(&config);
+        let s3_client = match &self.s3_client {
+            Some(client) => client.clone(),
+            None => {
+                let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                aws_sdk_s3::Client::new(&config)
+            }
+        };
         let db_prefix = format!("{}{}/", self.prefix, name);
 
-        graphstream::download_new_segments(&s3_client, &self.bucket, &db_prefix, &journal_dir, 0)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to download journal segments: {e}"))?;
-
-        tracing::info!("KuzuReplicator: pulled journal segments for '{}'", name);
+        match graphstream::download_new_segments(&s3_client, &self.bucket, &db_prefix, &journal_dir, 0).await {
+            Ok(segments) => {
+                tracing::info!("KuzuReplicator: pulled {} journal segments for '{}'", segments.len(), name);
+            }
+            Err(e) => {
+                tracing::warn!("KuzuReplicator: pull for '{}' failed (will catch up via follower loop): {}", name, e);
+            }
+        }
         Ok(())
     }
 

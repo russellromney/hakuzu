@@ -4,10 +4,38 @@
 //!
 //! hakuzu is to Kuzu/graphd what haqlite is to SQLite — the HA layer that wraps
 //! graphstream's journal replication and hadb's coordination framework.
+//!
+//! ```ignore
+//! use hakuzu::{HaKuzu, QueryResult};
+//!
+//! let db = HaKuzu::builder("my-bucket")
+//!     .open("/data/graph", "CREATE NODE TABLE IF NOT EXISTS Person(id INT64, name STRING, PRIMARY KEY(id))")
+//!     .await?;
+//!
+//! db.execute("CREATE (p:Person {id: $id, name: $name})", Some(json!({"id": 1, "name": "Alice"}))).await?;
+//! let result = db.query("MATCH (p:Person) RETURN p.id, p.name", None).await?;
+//! ```
 
+pub mod database;
 pub mod follower_behavior;
+pub mod forwarding;
+pub mod mutation;
 pub mod replay;
 pub mod replicator;
+pub mod snapshot;
+pub mod values;
 
-pub use follower_behavior::KuzuFollowerBehavior;
+// Primary API.
+pub use database::{HaKuzu, HaKuzuBuilder, QueryResult, SnapshotConfig};
+pub use snapshot::SnapshotMeta;
 pub use replicator::KuzuReplicator;
+pub use follower_behavior::KuzuFollowerBehavior;
+
+// Re-export hadb types.
+pub use hadb::{
+    Coordinator, CoordinatorConfig, HaMetrics, InMemoryLeaseStore, LeaseConfig,
+    LeaseData, LeaseStore, MetricsSnapshot, NodeRegistration, NodeRegistry, Role, RoleEvent,
+};
+
+// Re-export hadb-s3 implementations.
+pub use hadb_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};

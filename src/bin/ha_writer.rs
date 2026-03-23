@@ -8,6 +8,9 @@
 //! Usage:
 //!   hakuzu-ha-writer --nodes http://localhost:9001,http://localhost:9002
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 use tracing::{error, info, warn};
 

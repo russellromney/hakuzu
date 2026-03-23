@@ -357,12 +357,14 @@ async fn test_replicator_pull_from_s3() {
     upload_sealed_files(&client, &leader_journal, &bucket, &db_prefix).await;
 
     // Use replicator.pull() to download.
+    // pull() treats `path` as a db path and creates journal at path.parent()/journal/.
     let follower_base = dir.path().join("follower");
     std::fs::create_dir_all(&follower_base).unwrap();
+    let follower_db_path = follower_base.join("db");
 
     let replicator = hakuzu::KuzuReplicator::new(bucket.clone(), prefix.clone());
     use hadb::Replicator;
-    replicator.pull("graph", &follower_base).await.unwrap();
+    replicator.pull("graph", &follower_db_path).await.unwrap();
 
     // Verify journal segments were downloaded.
     let follower_journal = follower_base.join("journal");
