@@ -20,6 +20,7 @@ pub struct HakuzuMetrics {
     // Timing (microseconds)
     pub last_write_duration_us: AtomicU64,
     pub last_read_duration_us: AtomicU64,
+    pub last_forward_duration_us: AtomicU64,
 
     // Journal
     pub journal_sequence: AtomicU64,
@@ -34,6 +35,7 @@ impl HakuzuMetrics {
             forwarding_errors: AtomicU64::new(0),
             last_write_duration_us: AtomicU64::new(0),
             last_read_duration_us: AtomicU64::new(0),
+            last_forward_duration_us: AtomicU64::new(0),
             journal_sequence: AtomicU64::new(0),
         }
     }
@@ -58,6 +60,7 @@ impl HakuzuMetrics {
             forwarding_errors: self.forwarding_errors.load(Ordering::Relaxed),
             last_write_duration_us: self.last_write_duration_us.load(Ordering::Relaxed),
             last_read_duration_us: self.last_read_duration_us.load(Ordering::Relaxed),
+            last_forward_duration_us: self.last_forward_duration_us.load(Ordering::Relaxed),
             journal_sequence: self.journal_sequence.load(Ordering::Relaxed),
         }
     }
@@ -77,6 +80,7 @@ pub struct HakuzuMetricsSnapshot {
     pub forwarding_errors: u64,
     pub last_write_duration_us: u64,
     pub last_read_duration_us: u64,
+    pub last_forward_duration_us: u64,
     pub journal_sequence: u64,
 }
 
@@ -120,6 +124,12 @@ impl HakuzuMetricsSnapshot {
             "hakuzu_last_read_duration_seconds",
             "Duration of last read operation",
             self.last_read_duration_us as f64 / 1_000_000.0,
+        );
+        Self::gauge(
+            &mut out,
+            "hakuzu_last_forward_duration_seconds",
+            "Duration of last forwarded write operation",
+            self.last_forward_duration_us as f64 / 1_000_000.0,
         );
         Self::gauge(
             &mut out,
@@ -209,6 +219,7 @@ mod tests {
             "hakuzu_forwarding_errors_total",
             "hakuzu_last_write_duration_seconds",
             "hakuzu_last_read_duration_seconds",
+            "hakuzu_last_forward_duration_seconds",
             "hakuzu_journal_sequence",
         ];
         for name in expected {

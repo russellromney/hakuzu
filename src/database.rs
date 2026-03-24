@@ -23,6 +23,7 @@ use hadb_lease_s3::S3LeaseStore;
 use crate::error::HakuzuError;
 use crate::follower_behavior::KuzuFollowerBehavior;
 use crate::forwarding::{self, ForwardingState};
+use crate::metrics;
 use crate::mutation::is_mutation;
 use crate::replicator::KuzuReplicator;
 use crate::rewriter;
@@ -244,7 +245,9 @@ impl HaKuzuBuilder {
                         meta.db_size_bytes
                     );
 
-                    let _ = std::fs::remove_dir_all(&snap_dest);
+                    if let Err(e) = std::fs::remove_dir_all(&snap_dest) {
+                        tracing::error!("Failed to clean snapshot staging dir: {e}");
+                    }
                 }
                 Ok(None) => {
                     tracing::debug!("No snapshots available, starting fresh");
@@ -345,6 +348,7 @@ pub(crate) struct HaKuzuInner {
     leader_address: RwLock<String>,
     http_client: reqwest::Client,
     pub(crate) secret: Option<String>,
+    pub(crate) metrics: Arc<metrics::HakuzuMetrics>,
 }
 
 impl HaKuzuInner {
@@ -392,6 +396,7 @@ impl HaKuzuInner {
         cypher: &str,
         params: Option<&serde_json::Value>,
     ) -> Result<()> {
+        let write_start = std::time::Instant::now();
         let _guard = self.write_mutex.lock().await;
 
         // Rewrite non-deterministic functions before execution.
@@ -444,6 +449,8 @@ impl HaKuzuInner {
             }
         }
 
+        self.metrics.inc(&self.metrics.writes_total);
+        self.metrics.record_duration(&self.metrics.last_write_duration_us, write_start);
         Ok(())
     }
 }
@@ -476,6 +483,7 @@ impl HaKuzu {
             leader_address: RwLock::new(String::new()),
             http_client: reqwest::Client::new(),
             secret: None,
+            metrics: Arc::new(metrics::HakuzuMetrics::new()),
         });
 
         let fwd_handle = tokio::spawn(async {});
@@ -586,6 +594,7 @@ impl HaKuzu {
         cypher: &str,
         params: Option<serde_json::Value>,
     ) -> crate::error::Result<QueryResult> {
+        let read_start = std::time::Instant::now();
         let _permit = self
             .inner
             .read_semaphore
@@ -598,7 +607,7 @@ impl HaKuzu {
         let cypher = cypher.to_string();
         let params_owned = params;
 
-        tokio::task::spawn_blocking(move || {
+        let qr = tokio::task::spawn_blocking(move || {
             let conn = lbug::Connection::new(&db)
                 .map_err(|e| HakuzuError::DatabaseError(format!("Failed to create connection: {e}")))?;
             let _snap = lock.read().unwrap_or_else(|e| e.into_inner());
@@ -626,10 +635,15 @@ impl HaKuzu {
                 rows.push(json_row);
             }
 
-            Ok(QueryResult { columns, rows })
+            Ok::<QueryResult, HakuzuError>(QueryResult { columns, rows })
         })
         .await
         .map_err(|e| HakuzuError::DatabaseError(format!("Task panicked: {e}")))?
+        ?;
+
+        self.inner.metrics.inc(&self.inner.metrics.reads_total);
+        self.inner.metrics.record_duration(&self.inner.metrics.last_read_duration_us, read_start);
+        Ok(qr)
     }
 
     /// Get the current role of this node.
@@ -648,11 +662,14 @@ impl HaKuzu {
     }
 
     /// Get metrics in Prometheus exposition format.
-    pub fn prometheus_metrics(&self) -> Option<String> {
-        self.inner
-            .coordinator
-            .as_ref()
-            .map(|c| c.metrics().snapshot().to_prometheus())
+    /// Concatenates hadb coordinator metrics + hakuzu operation metrics.
+    pub fn prometheus_metrics(&self) -> String {
+        let mut out = String::new();
+        if let Some(c) = self.inner.coordinator.as_ref() {
+            out.push_str(&c.metrics().snapshot().to_prometheus());
+        }
+        out.push_str(&self.inner.metrics.snapshot().to_prometheus());
+        out
     }
 
     /// Graceful leader handoff with drain barrier.
@@ -689,10 +706,18 @@ impl HaKuzu {
             .map_err(|e| HakuzuError::CoordinatorError(e.to_string()))
     }
 
-    /// Cleanly shut down: drain writes, seal journal, leave cluster, stop tasks.
+    /// Cleanly shut down: stop accepting new ops, drain in-flight work, seal journal,
+    /// leave cluster, stop background tasks.
+    ///
+    /// After close() returns, all in-flight reads and writes have completed.
+    /// New operations started concurrently will get `EngineClosed`.
     pub async fn close(self) -> crate::error::Result<()> {
+        // Close semaphore — new reads immediately get EngineClosed.
+        // In-flight reads continue until they release their permits.
+        self.inner.read_semaphore.close();
+
         if let Some(ref coordinator) = self.inner.coordinator {
-            // Drain: wait for in-flight writes + seal journal before leaving.
+            // Drain in-flight writes + seal journal before leaving.
             {
                 let _guard = self.inner.write_mutex.lock().await;
                 if let Some(ref replicator) = self.inner.replicator {
@@ -708,12 +733,14 @@ impl HaKuzu {
                 .map_err(|e| HakuzuError::CoordinatorError(e.to_string()))?;
         }
 
+        // Abort the forwarding server (stops accepting forwarded writes from followers)
+        // and the role listener. In-flight spawn_blocking tasks (reads/writes) hold
+        // Arc<HaKuzuInner> clones and will complete independently.
         self._fwd_handle.abort();
         self._role_handle.abort();
 
-        // Wait for tasks to finish so their Arc<HaKuzuInner> refs are released
-        // before the Database is dropped. Otherwise the lbug::Database destructor
-        // can race with TempDir cleanup in tests (or filesystem removal in prod).
+        // Wait for background tasks to finish so their Arc<HaKuzuInner> refs are
+        // released before the Database is dropped.
         let _ = self._fwd_handle.await;
         let _ = self._role_handle.await;
 
@@ -729,6 +756,7 @@ impl HaKuzu {
         cypher: &str,
         params: Option<&serde_json::Value>,
     ) -> crate::error::Result<()> {
+        let start = std::time::Instant::now();
         let leader_addr = self.inner.leader_addr();
         if leader_addr.is_empty() {
             return Err(HakuzuError::NotLeader);
@@ -740,23 +768,75 @@ impl HaKuzu {
             params: params.cloned(),
         };
 
-        let mut req = self.inner.http_client.post(&url).json(&body);
-        if let Some(ref secret) = self.inner.secret {
-            req = req.bearer_auth(secret);
-        }
-        let resp = req.send().await.map_err(|e| {
-            HakuzuError::LeaderUnavailable(format!("Failed to forward write: {e}"))
-        })?;
+        // Retry with exponential backoff: 100ms, 400ms, 1600ms.
+        let backoffs = [
+            Duration::from_millis(100),
+            Duration::from_millis(400),
+            Duration::from_millis(1600),
+        ];
+        let mut last_err = None;
 
-        if !resp.status().is_success() {
-            return Err(HakuzuError::LeaderUnavailable(format!(
-                "Leader returned error: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            )));
+        for (attempt, backoff) in std::iter::once(&Duration::ZERO)
+            .chain(backoffs.iter())
+            .enumerate()
+        {
+            if attempt > 0 {
+                tokio::time::sleep(*backoff).await;
+            }
+
+            let mut req = self.inner.http_client.post(&url).json(&body);
+            if let Some(ref secret) = self.inner.secret {
+                req = req.bearer_auth(secret);
+            }
+
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    self.inner.metrics.inc(&self.inner.metrics.writes_forwarded);
+                    self.inner.metrics.record_duration(
+                        &self.inner.metrics.last_forward_duration_us,
+                        start,
+                    );
+                    return Ok(());
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body_text = resp.text().await.unwrap_or_default();
+                    // Don't retry client errors (4xx) — they won't succeed on retry.
+                    if status.is_client_error() {
+                        self.inner.metrics.inc(&self.inner.metrics.forwarding_errors);
+                        self.inner.metrics.record_duration(
+                            &self.inner.metrics.last_forward_duration_us,
+                            start,
+                        );
+                        return Err(HakuzuError::LeaderUnavailable(format!(
+                            "Leader returned error: {} {}",
+                            status, body_text
+                        )));
+                    }
+                    last_err = Some(format!("Leader returned error: {} {}", status, body_text));
+                }
+                Err(e) => {
+                    last_err = Some(format!("Failed to forward write: {e}"));
+                }
+            }
+
+            if attempt < backoffs.len() {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    "Forwarding write failed, retrying in {:?}",
+                    backoffs.get(attempt).unwrap_or(&Duration::ZERO)
+                );
+            }
         }
 
-        Ok(())
+        self.inner.metrics.inc(&self.inner.metrics.forwarding_errors);
+        self.inner.metrics.record_duration(
+            &self.inner.metrics.last_forward_duration_us,
+            start,
+        );
+        Err(HakuzuError::LeaderUnavailable(
+            last_err.unwrap_or_else(|| "Forwarding failed after retries".into()),
+        ))
     }
 }
 
@@ -822,6 +902,7 @@ async fn open_with_coordinator(
         leader_address: RwLock::new(leader_addr),
         http_client,
         secret: secret.clone(),
+        metrics: Arc::new(metrics::HakuzuMetrics::new()),
     });
 
     // If leader, grab the journal sender from the replicator.

@@ -13,6 +13,13 @@ use crate::database::{HaKuzuInner, SnapshotConfig};
 use crate::replicator::KuzuReplicator;
 use crate::snapshot;
 
+/// Remove a directory, logging any errors instead of silently dropping them.
+fn remove_dir_logged(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        tracing::error!("Failed to remove staging dir {}: {e}", path.display());
+    }
+}
+
 /// Internal snapshot context passed to the role listener.
 pub(crate) struct SnapshotContext {
     pub(crate) config: SnapshotConfig,
@@ -47,6 +54,13 @@ pub(crate) async fn run_snapshot_loop(
 ) {
     let mut last_snapshot_seq: u64 = 0;
     let mut interval = tokio::time::interval(config.interval);
+    let mut ticks_since_cleanup: u32 = 0;
+    // Run stale staging cleanup every ~5 minutes (ticks depend on interval).
+    let cleanup_every_n = std::cmp::max(
+        1,
+        (300.0 / config.interval.as_secs_f64()).ceil() as u32,
+    );
+    let base_dir = db_path.parent().unwrap_or(&db_path).to_path_buf();
 
     // Skip the first tick (fires immediately).
     interval.tick().await;
@@ -54,6 +68,19 @@ pub(crate) async fn run_snapshot_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // Periodic cleanup of stale staging dirs (orphaned by crashes/panics).
+                ticks_since_cleanup += 1;
+                if ticks_since_cleanup >= cleanup_every_n {
+                    ticks_since_cleanup = 0;
+                    let freed = snapshot::cleanup_stale_staging(
+                        &base_dir,
+                        std::time::Duration::from_secs(3600), // 1 hour max age
+                    );
+                    if freed > 0 {
+                        tracing::info!(bytes_freed = freed, "Cleaned stale snapshot staging dirs");
+                    }
+                }
+
                 let state = match replicator.journal_state(&db_name).await {
                     Some(s) => s,
                     None => continue,
@@ -105,12 +132,12 @@ pub(crate) async fn run_snapshot_loop(
                     Ok(Ok(size)) => size,
                     Ok(Err(e)) => {
                         tracing::error!("Snapshot creation failed: {e}");
-                        let _ = std::fs::remove_dir_all(&snap_dir);
+                        remove_dir_logged(&snap_dir);
                         continue;
                     }
                     Err(e) => {
                         tracing::error!("Snapshot task panicked: {e}");
-                        let _ = std::fs::remove_dir_all(&snap_dir);
+                        remove_dir_logged(&snap_dir);
                         continue;
                     }
                 };
@@ -129,7 +156,7 @@ pub(crate) async fn run_snapshot_loop(
                 .await
                 {
                     tracing::error!("Snapshot upload failed: {e}");
-                    let _ = std::fs::remove_dir_all(&snap_dir);
+                    remove_dir_logged(&snap_dir);
                     continue;
                 }
 
@@ -141,7 +168,7 @@ pub(crate) async fn run_snapshot_loop(
                 );
 
                 // Clean up local snapshot file.
-                let _ = std::fs::remove_dir_all(&snap_dir);
+                remove_dir_logged(&snap_dir);
             }
             _ = cancel_rx.changed() => {
                 tracing::info!("Snapshot loop cancelled for '{}'", db_name);

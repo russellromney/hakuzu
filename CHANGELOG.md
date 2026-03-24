@@ -1,5 +1,61 @@
 # hakuzu Changelog
 
+## Phase 9.5: Review Fixes — Metrics Wiring & Test Coverage
+
+### Metrics wired into code paths
+`writes_total` incremented in `execute_write_local()` on success. `reads_total` and `last_read_duration_us` recorded in `query()`. `writes_forwarded` incremented in `execute_forwarded()` on success. `forwarding_errors` incremented on 4xx and exhausted retries. `last_write_duration_us` recorded in `execute_write_local()`. Previously all counters were declared but never incremented — `prometheus_metrics()` returned zeros.
+
+Files: `src/database.rs`
+
+### Snapshot cleanup — remaining silent drops fixed
+Two `let _ = remove_dir_all(...)` calls in `snapshot_loop.rs` (upload failure cleanup and success cleanup) converted to `remove_dir_logged()`. Now ALL error paths in the snapshot loop log errors.
+
+Files: `src/snapshot_loop.rs`
+
+### Weak tests replaced
+- `forwarding_retry_on_server_error` → `forwarding_retry_exhausts_backoff` — shuts down leader, verifies follower retries with backoff (>1500ms elapsed), gets `LeaderUnavailable`, and `forwarding_errors` counter is 1.
+- `close_rejects_new_reads` → `close_completes_with_data` (verifies close works with data) + `close_then_reopen_preserves_data` (close/reopen cycle preserves 5 entries).
+- `metrics_track_writes_and_reads` — 3 writes + 2 reads, verifies exact counter values and non-zero durations in prometheus output.
+
+### Tests (3 new, 168 total)
+- `metrics_track_writes_and_reads` — verify prometheus counters reflect actual operations
+- `forwarding_retry_exhausts_backoff` — verify retry timing and forwarding_errors metric
+- `close_then_reopen_preserves_data` — verify close/reopen preserves all data
+- `close_completes_with_data` — renamed from `close_rejects_new_reads`
+- `prometheus_metrics_includes_hakuzu` — now verifies counter values, not just metric names
+
+168 tests pass (116 lib + 16 ha_database + 14 integration + 22 real_world).
+
+## Phase 9: Production Hardening — Graceful Ops
+
+### Graceful shutdown
+`close()` now closes the read semaphore before teardown — new reads immediately get `EngineClosed` while in-flight reads complete naturally. Previously, `close()` aborted tasks while reads could still be starting.
+
+Files: `src/database.rs`
+
+### Forwarding retry with backoff
+`execute_forwarded()` retries transient failures (connection errors, 5xx) with exponential backoff: 100ms, 400ms, 1600ms. Client errors (4xx) fail immediately without retry. Previously, a single transient network failure between follower→leader failed the write.
+
+Files: `src/database.rs`
+
+### Snapshot cleanup error propagation
+All `let _ = remove_dir_all(...)` calls in the snapshot loop now log errors at `error!` level instead of silently dropping them. Added periodic stale staging directory cleanup (every ~5 minutes) via `cleanup_stale_staging()` — removes orphaned `snapshots_tmp/` dirs older than 1 hour.
+
+Files: `src/snapshot_loop.rs`, `src/database.rs`
+
+### Forwarding latency metric
+Added `last_forward_duration_us` to `HakuzuMetrics`, exposed as `hakuzu_last_forward_duration_seconds` in Prometheus format. Records timing on every forwarded write (success, client error, and exhausted retries). `prometheus_metrics()` now returns hakuzu operation metrics alongside hadb coordinator metrics (changed return type from `Option<String>` to `String`).
+
+Files: `src/metrics.rs`, `src/database.rs`
+
+### Tests (4 new, 166 total)
+- `close_rejects_new_reads` — verify close() completes cleanly with data present
+- `close_with_concurrent_reads` — close with 5 concurrent reads in flight
+- `forwarding_retry_on_server_error` — verify leader path works with retry infrastructure
+- `prometheus_metrics_includes_hakuzu` — verify hakuzu metrics in prometheus output
+
+166 tests pass (116 lib + 14 ha_database + 14 integration + 22 real_world). *(Updated to 168 in Phase 9.5.)*
+
 ## Phase 8: Production Hardening — Silent Failure Elimination
 
 ### Journal send failure propagation

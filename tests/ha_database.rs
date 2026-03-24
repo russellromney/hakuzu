@@ -601,3 +601,301 @@ async fn journal_error_contains_message() {
     assert!(msg.contains("Journal"), "Error message should mention Journal: {}", msg);
     assert!(msg.contains("writer crashed"), "Error message should contain detail: {}", msg);
 }
+
+// ============================================================================
+// Phase 9: Graceful ops tests
+// ============================================================================
+
+#[tokio::test]
+async fn close_completes_with_data() {
+    // Verify close() completes cleanly when the database has data.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("close_data_db");
+
+    let db = HaKuzu::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    // Write data.
+    db.execute(
+        "CREATE (:Person {id: $id, name: $name})",
+        Some(json!({"id": 1, "name": "Test"})),
+    )
+    .await
+    .unwrap();
+
+    // Verify data exists before close.
+    let result = db.query("MATCH (p:Person) RETURN count(p) AS cnt", None).await.unwrap();
+    assert_eq!(result.rows[0][0], json!(1));
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn close_then_reopen_preserves_data() {
+    // Verify close + reopen cycle preserves data (regression: close must
+    // not corrupt the database).
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("close_reopen_db");
+
+    // Write data, close.
+    let db = HaKuzu::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    for i in 1..=5 {
+        db.execute(
+            "CREATE (:Person {id: $id, name: $name})",
+            Some(json!({"id": i, "name": format!("P{}", i)})),
+        )
+        .await
+        .unwrap();
+    }
+    db.close().await.unwrap();
+
+    // Reopen, verify all 5 entries survived.
+    let db = HaKuzu::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    let result = db.query("MATCH (p:Person) RETURN count(p) AS cnt", None).await.unwrap();
+    assert_eq!(result.rows[0][0], json!(5));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn close_with_concurrent_reads() {
+    // Verify close() works cleanly even when reads are in flight.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("close_concurrent_db");
+
+    let db = HaKuzu::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+    for i in 1..=10 {
+        db.execute(
+            "CREATE (:Person {id: $id, name: $name})",
+            Some(json!({"id": i, "name": format!("P{}", i)})),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Spawn some concurrent reads, then close.
+    let db = Arc::new(db);
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let db_ref = db.clone();
+        handles.push(tokio::spawn(async move {
+            db_ref.query("MATCH (p:Person) RETURN count(p)", None).await
+        }));
+    }
+
+    // Wait for reads to complete.
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    // Close should succeed cleanly.
+    Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+}
+
+#[tokio::test]
+async fn metrics_track_writes_and_reads() {
+    // Verify that writes and reads increment the correct metrics counters.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("metrics_counters_db");
+
+    let db = HaKuzu::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    // Do 3 writes.
+    for i in 1..=3 {
+        db.execute(
+            "CREATE (:Person {id: $id, name: $name})",
+            Some(json!({"id": i, "name": format!("P{}", i)})),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Do 2 reads.
+    for _ in 0..2 {
+        db.query("MATCH (p:Person) RETURN count(p)", None)
+            .await
+            .unwrap();
+    }
+
+    let metrics_text = db.prometheus_metrics();
+
+    // Verify write counter = 3.
+    assert!(
+        metrics_text.contains("hakuzu_writes_total 3"),
+        "Expected writes_total 3, got: {}",
+        metrics_text
+    );
+
+    // Verify read counter = 2.
+    assert!(
+        metrics_text.contains("hakuzu_reads_total 2"),
+        "Expected reads_total 2, got: {}",
+        metrics_text
+    );
+
+    // Verify duration gauges are non-zero.
+    assert!(
+        !metrics_text.contains("hakuzu_last_write_duration_seconds 0.000000"),
+        "Write duration should be non-zero"
+    );
+    assert!(
+        !metrics_text.contains("hakuzu_last_read_duration_seconds 0.000000"),
+        "Read duration should be non-zero"
+    );
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn forwarding_retry_exhausts_backoff() {
+    // Verify that forwarding to a non-existent leader retries with backoff
+    // and takes at least ~2 seconds (100ms + 400ms + 1600ms = 2100ms).
+    let tmp1 = TempDir::new().unwrap();
+    let tmp2 = TempDir::new().unwrap();
+    let db_path1 = tmp1.path().join("retry_leader");
+    let db_path2 = tmp2.path().join("retry_follower");
+
+    let lease_store: Arc<dyn hakuzu::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    // Leader — register it so follower sees the leader address.
+    let db1 = lbug::Database::new(&db_path1, lbug::SystemConfig::default()).unwrap();
+    {
+        let conn = lbug::Connection::new(&db1).unwrap();
+        conn.query(SCHEMA).unwrap();
+    }
+    let db1 = Arc::new(db1);
+
+    let (coord1, repl1) = build_coordinator(
+        lease_store.clone(),
+        "retry-leader",
+        "http://localhost:19060",
+        db1.clone(),
+    );
+
+    let leader = HaKuzu::from_coordinator(
+        coord1,
+        repl1,
+        db1,
+        db_path1.to_str().unwrap(),
+        "retry_db",
+        19060,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(leader.role(), Some(Role::Leader));
+
+    // Follower.
+    let db2 = lbug::Database::new(&db_path2, lbug::SystemConfig::default()).unwrap();
+    {
+        let conn = lbug::Connection::new(&db2).unwrap();
+        conn.query(SCHEMA).unwrap();
+    }
+    let db2 = Arc::new(db2);
+
+    let (coord2, repl2) = build_coordinator(
+        lease_store.clone(),
+        "retry-follower",
+        "http://localhost:19061",
+        db2.clone(),
+    );
+
+    let follower = HaKuzu::from_coordinator(
+        coord2,
+        repl2,
+        db2,
+        db_path2.to_str().unwrap(),
+        "retry_db",
+        19061,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(follower.role(), Some(Role::Follower));
+
+    // Shut down the leader's forwarding server so follower's forwarding fails.
+    leader.close().await.unwrap();
+
+    // Now the follower will try to forward to the dead leader and retry.
+    let start = std::time::Instant::now();
+    let result = follower
+        .execute(
+            "CREATE (:Person {id: $id, name: $name})",
+            Some(json!({"id": 1, "name": "Retry"})),
+        )
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_err(), "Should fail after retries: {:?}", result);
+    assert!(
+        matches!(result.unwrap_err(), HakuzuError::LeaderUnavailable(_)),
+        "Should be LeaderUnavailable"
+    );
+
+    // Backoff: 0ms + 100ms + 400ms + 1600ms = ~2100ms minimum.
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "Should take >= 1500ms from retries, took {:?}",
+        elapsed
+    );
+
+    // Verify forwarding_errors metric was incremented.
+    let metrics = follower.prometheus_metrics();
+    assert!(
+        metrics.contains("hakuzu_forwarding_errors_total 1"),
+        "Expected forwarding_errors 1, got: {}",
+        metrics
+    );
+
+    follower.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn prometheus_metrics_includes_hakuzu() {
+    // Verify prometheus_metrics() includes hakuzu-level metrics with correct values.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("metrics_db");
+
+    let db = HaKuzu::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    // Do some operations.
+    db.execute(
+        "CREATE (:Person {id: $id, name: $name})",
+        Some(json!({"id": 1, "name": "Alice"})),
+    )
+    .await
+    .unwrap();
+
+    db.query("MATCH (p:Person) RETURN count(p)", None)
+        .await
+        .unwrap();
+
+    let metrics_text = db.prometheus_metrics();
+
+    // All metric names present.
+    let expected_names = [
+        "hakuzu_writes_total",
+        "hakuzu_writes_forwarded_total",
+        "hakuzu_reads_total",
+        "hakuzu_forwarding_errors_total",
+        "hakuzu_last_write_duration_seconds",
+        "hakuzu_last_read_duration_seconds",
+        "hakuzu_last_forward_duration_seconds",
+        "hakuzu_journal_sequence",
+    ];
+    for name in expected_names {
+        assert!(metrics_text.contains(name), "Missing metric: {}", name);
+    }
+
+    // Values are correct after 1 write + 1 read.
+    assert!(
+        metrics_text.contains("hakuzu_writes_total 1"),
+        "Expected writes_total 1: {}",
+        metrics_text
+    );
+    assert!(
+        metrics_text.contains("hakuzu_reads_total 1"),
+        "Expected reads_total 1: {}",
+        metrics_text
+    );
+
+    db.close().await.unwrap();
+}
