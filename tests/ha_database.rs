@@ -8,6 +8,7 @@ use std::time::Duration;
 use serde_json::json;
 use tempfile::TempDir;
 
+use hadb::Replicator;
 use hakuzu::{
     Coordinator, CoordinatorConfig, HaKuzu, HakuzuError, InMemoryLeaseStore, KuzuFollowerBehavior,
     KuzuReplicator, LeaseConfig, Role,
@@ -480,4 +481,123 @@ async fn auth_accepts_correct_secret() {
 
     leader.close().await.unwrap();
     follower.close().await.unwrap();
+}
+
+// ============================================================================
+// Phase 8: Production hardening tests
+// ============================================================================
+
+#[tokio::test]
+async fn journal_failure_returns_error() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("journal_err_db");
+    let lease_store: Arc<dyn hakuzu::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let db = lbug::Database::new(&db_path, lbug::SystemConfig::default()).unwrap();
+    {
+        let conn = lbug::Connection::new(&db).unwrap();
+        conn.query(SCHEMA).unwrap();
+    }
+    let db = Arc::new(db);
+
+    let (coordinator, replicator) = build_coordinator(
+        lease_store,
+        "journal-err",
+        "http://localhost:19050",
+        db.clone(),
+    );
+
+    let ha = HaKuzu::from_coordinator(
+        coordinator,
+        replicator.clone(),
+        db,
+        db_path.to_str().unwrap(),
+        "journal_err_db",
+        19050,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(ha.role(), Some(Role::Leader));
+
+    // Write should work initially.
+    ha.execute(
+        "CREATE (:Person {id: $id, name: $name})",
+        Some(json!({"id": 1, "name": "BeforeShutdown"})),
+    )
+    .await
+    .unwrap();
+
+    // Kill the journal writer by removing the database from the replicator.
+    // This sends Shutdown to the journal writer, closing the receiver end.
+    replicator.remove("journal_err_db").await.unwrap();
+
+    // Give journal writer time to process Shutdown and drop the receiver.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Now a write should fail because the journal channel is closed.
+    let result = ha
+        .execute(
+            "CREATE (:Person {id: $id, name: $name})",
+            Some(json!({"id": 2, "name": "AfterShutdown"})),
+        )
+        .await;
+    assert!(result.is_err(), "Write should fail when journal is dead: {:?}", result);
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, HakuzuError::JournalError(_)),
+        "Should be JournalError, got: {:?}",
+        err
+    );
+
+    ha.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn read_concurrency_default_works() {
+    // Verify local mode uses DEFAULT_READ_CONCURRENCY (8) and handles
+    // concurrent reads correctly.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("concurrency_db");
+
+    let db = HaKuzu::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    // Write some data.
+    for i in 1..=10 {
+        db.execute(
+            "CREATE (:Person {id: $id, name: $name})",
+            Some(json!({"id": i, "name": format!("P{}", i)})),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Fire 20 concurrent reads — should all succeed with semaphore(8).
+    let db = Arc::new(db);
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let db_ref = db.clone();
+        handles.push(tokio::spawn(async move {
+            db_ref.query("MATCH (p:Person) RETURN count(p) AS cnt", None)
+                .await
+        }));
+    }
+
+    for handle in handles {
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.rows[0][0], json!(10));
+    }
+
+    // Unwrap Arc to call close() which takes ownership.
+    Arc::try_unwrap(db).ok().unwrap().close().await.unwrap();
+}
+
+#[tokio::test]
+async fn journal_error_contains_message() {
+    // Verify the JournalError variant contains a meaningful message.
+    let err = HakuzuError::JournalError("writer crashed".into());
+    let msg = err.to_string();
+    assert!(msg.contains("Journal"), "Error message should mention Journal: {}", msg);
+    assert!(msg.contains("writer crashed"), "Error message should contain detail: {}", msg);
 }

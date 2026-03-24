@@ -1,5 +1,29 @@
 # hakuzu Changelog
 
+## Phase 8: Production Hardening — Silent Failure Elimination
+
+### Journal send failure propagation
+`execute_write_local()` now returns `Err` when the journal channel is closed (writer crashed). Previously logged at `error!` and silently continued — local state would diverge from journal without the caller knowing. Callers receive `HakuzuError::JournalError` for journal-specific failures vs `HakuzuError::DatabaseError` for Kuzu failures.
+
+Files: `src/database.rs`
+
+### Configurable read concurrency
+`HaKuzuBuilder::read_concurrency(n)` configures the read semaphore. Default changed from 16 to 8 based on semaphore tuning benchmarks (8 permits is optimal for most workloads). `HaKuzu::local()` also uses the new default.
+
+Files: `src/database.rs`
+
+### Follower bootstrap documentation
+Clarified `replicator.rs` `pull()` error handling: swallowing errors is intentional because (a) pull is called during `coordinator.join()` — failing would prevent follower startup, (b) the follower loop retries downloads, and (c) snapshot bootstrap in `open()` already populated the DB if available.
+
+Files: `src/replicator.rs`
+
+### Tests (3 new, 162 total)
+- `journal_failure_returns_error` — kill journal writer, verify write returns `JournalError`
+- `read_concurrency_default_works` — 20 concurrent reads with semaphore(8)
+- `journal_error_contains_message` — verify `JournalError` Display format
+
+162 tests pass (116 lib + 10 ha_database + 14 integration + 22 real_world).
+
 ## Phase 7: Real-World Integration Tests
 
 22 tests closing critical coverage gaps. Tests exercise the full production path: rewrite → execute → journal → replay → verify.

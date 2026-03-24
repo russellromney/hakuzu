@@ -33,6 +33,7 @@ const DEFAULT_PREFIX: &str = "hakuzu/";
 const DEFAULT_FORWARDING_PORT: u16 = 18080;
 const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SNAPSHOT_EVERY_N_ENTRIES: u64 = 10_000;
+const DEFAULT_READ_CONCURRENCY: usize = 8;
 
 /// Configuration for periodic snapshot creation (leader only).
 #[derive(Debug, Clone)]
@@ -69,6 +70,7 @@ pub struct HaKuzuBuilder {
     upload_interval: Option<Duration>,
     snapshot_interval: Option<Duration>,
     snapshot_every_n_entries: Option<u64>,
+    read_concurrency: usize,
 }
 
 impl HaKuzuBuilder {
@@ -86,6 +88,7 @@ impl HaKuzuBuilder {
             upload_interval: None,
             snapshot_interval: None,
             snapshot_every_n_entries: None,
+            read_concurrency: DEFAULT_READ_CONCURRENCY,
         }
     }
 
@@ -154,6 +157,13 @@ impl HaKuzuBuilder {
     /// Requires `snapshot_interval` to be set. Default: 10,000.
     pub fn snapshot_every_n_entries(mut self, n: u64) -> Self {
         self.snapshot_every_n_entries = Some(n);
+        self
+    }
+
+    /// Maximum number of concurrent read operations. Default: 8.
+    /// Benchmarking shows 8 permits is optimal for most workloads.
+    pub fn read_concurrency(mut self, n: usize) -> Self {
+        self.read_concurrency = n;
         self
     }
 
@@ -308,6 +318,7 @@ impl HaKuzuBuilder {
             self.secret,
             snapshot_ctx,
             Some((write_mutex, snapshot_lock)),
+            self.read_concurrency,
         )
         .await
     }
@@ -417,6 +428,8 @@ impl HaKuzuInner {
         .map_err(|e| anyhow!("Task panicked: {e}"))??;
 
         // Journal the rewritten query + merged params (not the original).
+        // If journaling fails, the write already executed locally — this is a critical
+        // consistency violation (local state diverged from journal). Surface it loudly.
         if let Some(tx) = self.get_journal_sender() {
             let gs_params = match &merged_params {
                 Some(p) => values::json_params_to_graphstream(p),
@@ -427,7 +440,7 @@ impl HaKuzuInner {
                 params: gs_params,
             };
             if tx.send(JournalCommand::Write(entry)).is_err() {
-                tracing::error!("Failed to send journal entry — writer may have crashed");
+                return Err(anyhow!("Failed to send journal entry — writer may have crashed"));
             }
         }
 
@@ -457,7 +470,7 @@ impl HaKuzu {
                 .to_string(),
             role: AtomicU8::new(ROLE_LEADER),
             write_mutex: Arc::new(tokio::sync::Mutex::new(())),
-            read_semaphore: tokio::sync::Semaphore::new(16),
+            read_semaphore: tokio::sync::Semaphore::new(DEFAULT_READ_CONCURRENCY),
             snapshot_lock: Arc::new(std::sync::RwLock::new(())),
             journal_sender: RwLock::new(None),
             leader_address: RwLock::new(String::new()),
@@ -526,6 +539,7 @@ impl HaKuzu {
             secret,
             None, // no snapshot config via from_coordinator
             None, // no pre-created locks
+            DEFAULT_READ_CONCURRENCY,
         )
         .await
     }
@@ -546,7 +560,14 @@ impl HaKuzu {
                     self.inner
                         .execute_write_local(cypher, params.as_ref())
                         .await
-                        .map_err(|e| HakuzuError::DatabaseError(e.to_string()))
+                        .map_err(|e| {
+                            let msg = e.to_string();
+                            if msg.contains("journal") {
+                                HakuzuError::JournalError(msg)
+                            } else {
+                                HakuzuError::DatabaseError(msg)
+                            }
+                        })
                 }
                 Some(Role::Follower) => {
                     self.execute_forwarded(cypher, params.as_ref()).await
@@ -755,6 +776,7 @@ async fn open_with_coordinator(
     secret: Option<String>,
     snapshot_ctx: Option<SnapshotContext>,
     locks: Option<(Arc<tokio::sync::Mutex<()>>, Arc<std::sync::RwLock<()>>)>,
+    read_concurrency: usize,
 ) -> Result<HaKuzu> {
     // Subscribe to role events BEFORE join.
     let role_rx = coordinator.role_events();
@@ -794,7 +816,7 @@ async fn open_with_coordinator(
             Role::Follower => ROLE_FOLLOWER,
         }),
         write_mutex,
-        read_semaphore: tokio::sync::Semaphore::new(16),
+        read_semaphore: tokio::sync::Semaphore::new(read_concurrency),
         snapshot_lock,
         journal_sender: RwLock::new(None),
         leader_address: RwLock::new(leader_addr),

@@ -158,10 +158,11 @@ impl Replicator for KuzuReplicator {
                 tracing::info!("KuzuReplicator: pulled {} journal segments for '{}'", segments.len(), name);
             }
             Err(e) => {
-                // Log at error level but don't fail — follower loop will catch up.
-                // Pull is called during coordinator.join() for followers; failing here
-                // would prevent the follower from starting at all. The follower's
-                // run_follower_loop will retry the download.
+                // Pull is called during coordinator.join() for followers. Failing here
+                // prevents the follower from starting. Log at error level — the follower
+                // loop will retry the download and catch up. This is acceptable because
+                // the snapshot bootstrap (in database.rs open()) already populated the DB
+                // if a snapshot was available, so reads won't be empty.
                 tracing::error!("KuzuReplicator: pull for '{}' failed (follower loop will retry): {}", name, e);
             }
         }
