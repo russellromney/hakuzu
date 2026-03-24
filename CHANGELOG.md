@@ -1,5 +1,46 @@
 # hakuzu Changelog
 
+## Phase 7: Real-World Integration Tests
+
+22 tests closing critical coverage gaps. Tests exercise the full production path: rewrite → execute → journal → replay → verify.
+
+### Rewriter execution tests (7 tests)
+Verify rewritten queries actually execute against Kuzu and produce correct results:
+- `gen_random_uuid()` → valid UUID v4 stored in database
+- `current_timestamp()` → ISO 8601 with Z suffix stored
+- `current_date()` → ISO 8601 date stored
+- `REMOVE n.prop` → property nulled via SET NULL rewrite
+- `REMOVE n.a, n.b` → multi-property null
+- Mixed UUID + timestamp in same query
+- User params + generated params coexist
+
+### Leader/follower deterministic replay verification (5 tests)
+Execute on leader via rewriter → journal → replay on follower → compare results:
+- UUID replay: 3 `gen_random_uuid()` writes, follower has identical UUIDs
+- Timestamp replay: `current_timestamp()` writes, follower timestamps match exactly
+- Date replay: `current_date()` match
+- REMOVE replay: leader REMOVE → follower SET NULL → both NULL
+- Mixed sequence: plain + rewritten writes, full state comparison
+
+### Complex Cypher coverage (7 tests)
+Realistic Cypher through the full execute → journal → replay path:
+- MERGE (create-or-match + update)
+- SET with multiple properties (STRING, INT64, DOUBLE)
+- DELETE nodes
+- Relationships: CREATE REL TABLE + edges with properties, multi-hop query
+- DELETE relationships (nodes preserved)
+- All param types: INT64, STRING, BOOLEAN, DOUBLE
+
+### Concurrent write stress tests (3 tests)
+- 50 concurrent writes via tokio::spawn, verify count correct
+- 30 concurrent UUID writes, verify all unique
+- Interleaved reads + writes (50 writers, 10 readers), counts monotonically non-decreasing
+- 1000 sequential writes, verify count + sample IDs
+
+Files: `tests/real_world.rs` (new, 22 tests)
+
+159 tests pass (116 lib + 7 ha_database + 14 integration + 22 real_world).
+
 ## Phase 6: Behavioral Parity with graphd/strana
 
 Deterministic query rewriting and correctness fixes from behavioral audit against graphd.

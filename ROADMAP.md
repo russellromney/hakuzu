@@ -1,3 +1,3 @@
 # hakuzu Roadmap
 
-No outstanding items. All phases (1–6) completed — see CHANGELOG.md.
+No outstanding items. All phases (1–7) completed — see CHANGELOG.md.
