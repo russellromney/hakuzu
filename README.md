@@ -1,5 +1,7 @@
 # hakuzu
 
+> **Experimental.** hakuzu is under active development and not yet stable. APIs will change without notice.
+
 HA Kuzu/LadybugDB with one line of code. Leader election, journal replication, write forwarding — just your app + an S3 bucket.
 
 hakuzu is to Kuzu/graph databases what [haqlite](https://github.com/russellromney/haqlite) is to SQLite — the HA layer that wraps [graphstream](https://github.com/russellromney/graphstream)'s journal replication and [hadb](https://github.com/russellromney/hadb)'s coordination framework.
