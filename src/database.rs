@@ -10,7 +10,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -276,11 +276,11 @@ impl HaKuzuBuilder {
 
         // Build follower behavior — shares locks with HaKuzuInner for replay serialization.
         let follower_s3 = aws_sdk_s3::Client::new(&s3_config);
-        let follower_behavior = Arc::new(
-            KuzuFollowerBehavior::new(follower_s3, self.bucket.clone())
-                .with_shared_db(db.clone())
-                .with_locks(write_mutex.clone(), snapshot_lock.clone()),
-        );
+        let follower_behavior = KuzuFollowerBehavior::new(follower_s3, self.bucket.clone())
+            .with_shared_db(db.clone())
+            .with_locks(write_mutex.clone(), snapshot_lock.clone());
+        let (follower_caught_up, follower_replay_position) = follower_behavior.readiness_state();
+        let follower_behavior = Arc::new(follower_behavior);
 
         // Build snapshot context for leader.
         let snapshot_ctx = self.snapshot_interval.map(|interval| SnapshotContext {
@@ -322,6 +322,7 @@ impl HaKuzuBuilder {
             snapshot_ctx,
             Some((write_mutex, snapshot_lock)),
             self.read_concurrency,
+            Some((follower_caught_up, follower_replay_position)),
         )
         .await
     }
@@ -349,6 +350,11 @@ pub(crate) struct HaKuzuInner {
     http_client: reqwest::Client,
     pub(crate) secret: Option<String>,
     pub(crate) metrics: Arc<metrics::HakuzuMetrics>,
+    /// Follower readiness — true when last poll found no new segments and
+    /// replay is complete. Leader always returns true.
+    follower_caught_up: Arc<AtomicBool>,
+    /// Last successfully replayed sequence number (follower only).
+    follower_replay_position: Arc<AtomicU64>,
 }
 
 impl HaKuzuInner {
@@ -484,6 +490,8 @@ impl HaKuzu {
             http_client: reqwest::Client::new(),
             secret: None,
             metrics: Arc::new(metrics::HakuzuMetrics::new()),
+            follower_caught_up: Arc::new(AtomicBool::new(true)), // local mode = always leader = always caught up
+            follower_replay_position: Arc::new(AtomicU64::new(0)),
         });
 
         let fwd_handle = tokio::spawn(async {});
@@ -548,6 +556,7 @@ impl HaKuzu {
             None, // no snapshot config via from_coordinator
             None, // no pre-created locks
             DEFAULT_READ_CONCURRENCY,
+            None, // no follower readiness state (tests build their own behavior)
         )
         .await
     }
@@ -661,14 +670,50 @@ impl HaKuzu {
         self.inner.coordinator.as_ref()
     }
 
+    /// Whether this node is ready to serve reads.
+    ///
+    /// - **Leader**: always returns `true`.
+    /// - **Follower**: returns `true` when the last poll found no new segments
+    ///   and all downloaded entries have been replayed.
+    /// - **Local mode**: always returns `true`.
+    ///
+    /// Use this for load balancer health checks — don't route reads to a
+    /// follower that hasn't finished catching up.
+    pub fn is_caught_up(&self) -> bool {
+        match self.inner.current_role() {
+            Some(Role::Leader) | None => true,
+            Some(Role::Follower) => self.inner.follower_caught_up.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The last successfully replayed journal sequence number (follower only).
+    /// Returns 0 for leaders and local mode.
+    pub fn replay_position(&self) -> u64 {
+        self.inner.follower_replay_position.load(Ordering::SeqCst)
+    }
+
     /// Get metrics in Prometheus exposition format.
-    /// Concatenates hadb coordinator metrics + hakuzu operation metrics.
+    /// Concatenates hadb coordinator metrics + hakuzu operation metrics + readiness.
     pub fn prometheus_metrics(&self) -> String {
         let mut out = String::new();
         if let Some(c) = self.inner.coordinator.as_ref() {
             out.push_str(&c.metrics().snapshot().to_prometheus());
         }
         out.push_str(&self.inner.metrics.snapshot().to_prometheus());
+        // Readiness metrics.
+        let caught_up = if self.is_caught_up() { 1 } else { 0 };
+        out.push_str(&format!(
+            "# HELP hakuzu_follower_caught_up Whether this node is caught up and ready for reads\n\
+             # TYPE hakuzu_follower_caught_up gauge\n\
+             hakuzu_follower_caught_up {}\n",
+            caught_up
+        ));
+        out.push_str(&format!(
+            "# HELP hakuzu_replay_position Last replayed journal sequence number\n\
+             # TYPE hakuzu_replay_position gauge\n\
+             hakuzu_replay_position {}\n",
+            self.replay_position()
+        ));
         out
     }
 
@@ -857,6 +902,7 @@ async fn open_with_coordinator(
     snapshot_ctx: Option<SnapshotContext>,
     locks: Option<(Arc<tokio::sync::Mutex<()>>, Arc<std::sync::RwLock<()>>)>,
     read_concurrency: usize,
+    readiness: Option<(Arc<AtomicBool>, Arc<AtomicU64>)>,
 ) -> Result<HaKuzu> {
     // Subscribe to role events BEFORE join.
     let role_rx = coordinator.role_events();
@@ -886,6 +932,12 @@ async fn open_with_coordinator(
         )
     });
 
+    let (follower_caught_up, follower_replay_position) = readiness.unwrap_or_else(|| {
+        let caught_up = Arc::new(AtomicBool::new(initial_role == Role::Leader));
+        let replay_pos = Arc::new(AtomicU64::new(0));
+        (caught_up, replay_pos)
+    });
+
     let inner = Arc::new(HaKuzuInner {
         coordinator: Some(coordinator),
         replicator: Some(replicator.clone()),
@@ -903,6 +955,8 @@ async fn open_with_coordinator(
         http_client,
         secret: secret.clone(),
         metrics: Arc::new(metrics::HakuzuMetrics::new()),
+        follower_caught_up,
+        follower_replay_position,
     });
 
     // If leader, grab the journal sender from the replicator.
@@ -973,6 +1027,7 @@ async fn run_role_listener(
         match role_rx.recv().await {
             Ok(RoleEvent::Promoted { db_name: name }) => {
                 tracing::info!("HaKuzu: promoted to leader for '{}'", name);
+                inner.follower_caught_up.store(true, Ordering::SeqCst);
                 inner.set_leader_addr(self_address.clone());
                 inner.set_role(Role::Leader);
 
@@ -1002,12 +1057,14 @@ async fn run_role_listener(
             Ok(RoleEvent::Demoted { db_name: name }) => {
                 tracing::error!("HaKuzu: demoted from leader for '{}'", name);
                 inner.set_role(Role::Follower);
+                inner.follower_caught_up.store(false, Ordering::SeqCst);
                 inner.set_journal_sender(None);
                 snapshot_loop::stop_snapshot_loop(&mut snapshot_shutdown, &mut snapshot_handle);
             }
             Ok(RoleEvent::Fenced { db_name: name }) => {
                 tracing::error!("HaKuzu: fenced for '{}' — stopping writes", name);
                 inner.set_role(Role::Follower);
+                inner.follower_caught_up.store(false, Ordering::SeqCst);
                 inner.set_journal_sender(None);
                 snapshot_loop::stop_snapshot_loop(&mut snapshot_shutdown, &mut snapshot_handle);
             }

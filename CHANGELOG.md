@@ -1,5 +1,36 @@
 # hakuzu Changelog
 
+## Phase 10: Follower Readiness & Edge Cases
+
+### Follower readiness API
+`is_caught_up()` returns whether a follower has replayed all available journal entries. Leaders and local-mode instances always return `true`. `replay_position()` returns the last successfully replayed sequence number. Both backed by `Arc<AtomicBool>` / `Arc<AtomicU64>` shared between `KuzuFollowerBehavior` and `HaKuzuInner`. Prometheus output includes `hakuzu_follower_caught_up` and `hakuzu_replay_position` gauges.
+
+Role transitions update readiness: promoted → caught_up=true, demoted/fenced → caught_up=false.
+
+Files: `src/database.rs`, `src/follower_behavior.rs`
+
+### u64 precision verification
+Verified as non-issue: `json_to_param_value()` handles all values in [0, i64::MAX] exactly via `as_i64()`. Values > i64::MAX fall through to f64, but Kuzu uses INT64 so they can't be stored anyway. Added boundary test and documentation.
+
+Files: `src/values.rs`
+
+### CALL mutation detection
+Added `CALL` to `MUTATION_KEYWORDS` as safe default. Read-only CALLs (e.g. `CALL current_setting('threads')`) are routed to the write path — slower but correct. Missing a mutating CALL (e.g. `CALL db.checkpoint()`) would be catastrophic. Word-boundary check prevents false positives on `CALLBACK`.
+
+Files: `src/mutation.rs`
+
+### Tests (8 new, 176 total)
+- `leader_is_always_caught_up` — local mode is_caught_up=true, replay_position=0
+- `ha_leader_is_caught_up` — HA leader via from_coordinator, is_caught_up=true
+- `readiness_metrics_in_prometheus` — verify follower_caught_up and replay_position gauges
+- `test_param_value_i64_max_is_exact_int` — boundary test for i64::MAX precision
+- `test_call_is_mutation` — CALL db.checkpoint() detected as mutation
+- `test_call_read_only_is_mutation` — read-only CALL routed to write path
+- `test_call_case_insensitive` — case insensitive CALL detection
+- `test_callback_is_not_mutation` — CALLBACK does not match CALL (word boundary)
+
+176 tests pass (121 lib + 19 ha_database + 14 integration + 22 real_world).
+
 ## Phase 9.5: Review Fixes — Metrics Wiring & Test Coverage
 
 ### Metrics wired into code paths

@@ -899,3 +899,91 @@ async fn prometheus_metrics_includes_hakuzu() {
 
     db.close().await.unwrap();
 }
+
+// ============================================================================
+// Phase 10: Follower readiness & edge cases
+// ============================================================================
+
+#[tokio::test]
+async fn leader_is_always_caught_up() {
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("caught_up_leader");
+
+    let db = HaKuzu::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    assert!(db.is_caught_up(), "Leader/local should always be caught up");
+    assert_eq!(db.replay_position(), 0, "Leader replay_position should be 0");
+
+    db.execute(
+        "CREATE (:Person {id: $id, name: $name})",
+        Some(json!({"id": 1, "name": "Alice"})),
+    )
+    .await
+    .unwrap();
+
+    assert!(db.is_caught_up(), "Leader still caught up after write");
+
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn ha_leader_is_caught_up() {
+    // Verify is_caught_up() returns true for an HA leader (not just local mode).
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("ha_caught_up");
+    let lease_store: Arc<dyn hakuzu::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+
+    let db = lbug::Database::new(&db_path, lbug::SystemConfig::default()).unwrap();
+    {
+        let conn = lbug::Connection::new(&db).unwrap();
+        conn.query(SCHEMA).unwrap();
+    }
+    let db = Arc::new(db);
+
+    let (coordinator, replicator) = build_coordinator(
+        lease_store,
+        "caught-up-leader",
+        "http://localhost:19070",
+        db.clone(),
+    );
+
+    let ha = HaKuzu::from_coordinator(
+        coordinator,
+        replicator,
+        db,
+        db_path.to_str().unwrap(),
+        "caught_up_db",
+        19070,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(ha.role(), Some(Role::Leader));
+    assert!(ha.is_caught_up(), "HA leader should be caught up");
+
+    ha.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn readiness_metrics_in_prometheus() {
+    // Verify readiness metrics appear in prometheus output.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("readiness_metrics_db");
+
+    let db = HaKuzu::local(db_path.to_str().unwrap(), SCHEMA).unwrap();
+
+    let metrics = db.prometheus_metrics();
+    assert!(
+        metrics.contains("hakuzu_follower_caught_up 1"),
+        "Local/leader should report caught_up=1: {}",
+        metrics
+    );
+    assert!(
+        metrics.contains("hakuzu_replay_position 0"),
+        "Local should report replay_position=0: {}",
+        metrics
+    );
+
+    db.close().await.unwrap();
+}

@@ -6,6 +6,11 @@
 const MUTATION_KEYWORDS: &[&str] = &[
     "CREATE", "MERGE", "DELETE", "DROP", "ALTER", "COPY", "SET", "REMOVE",
     "INSTALL", "UNINSTALL", "IMPORT", "ATTACH", "DETACH",
+    // CALL is routed to the write path as a safe default. Some CALLs are
+    // read-only (e.g., CALL current_setting('threads')), but others mutate
+    // (e.g., CALL db.checkpoint()). Routing read-only CALLs through the write
+    // path is slower but correct — missing a mutating CALL would be catastrophic.
+    "CALL",
 ];
 
 /// Returns true if the query likely contains a mutation keyword.
@@ -99,5 +104,27 @@ mod tests {
     #[test]
     fn test_case_insensitive() {
         assert!(is_mutation("create (:Person {name: 'Alice'})"));
+    }
+
+    #[test]
+    fn test_call_is_mutation() {
+        assert!(is_mutation("CALL db.checkpoint()"));
+    }
+
+    #[test]
+    fn test_call_read_only_is_mutation() {
+        // Read-only CALLs are routed to write path as a safe default.
+        assert!(is_mutation("CALL current_setting('threads')"));
+    }
+
+    #[test]
+    fn test_call_case_insensitive() {
+        assert!(is_mutation("call db.checkpoint()"));
+    }
+
+    #[test]
+    fn test_callback_is_not_mutation() {
+        // "CALLBACK" should not match "CALL" (word boundary).
+        assert!(!is_mutation("MATCH (p:CALLBACK) RETURN p"));
     }
 }

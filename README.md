@@ -89,7 +89,7 @@ soup run -p hadb -e development -- bash tests/e2e_ha.sh
 
 ## Tests
 
-168 tests: 116 lib + 16 ha_database + 14 integration + 22 real_world.
+176 tests: 121 lib + 19 ha_database + 14 integration + 22 real_world.
 
 ## License
 

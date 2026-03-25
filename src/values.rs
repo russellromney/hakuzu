@@ -166,7 +166,10 @@ fn json_to_param_value(v: &Value) -> ParamValue {
             if let Some(i) = n.as_i64() {
                 ParamValue::Int(i)
             } else if let Some(f) = n.as_f64() {
-                // Covers u64 > i64::MAX — may lose precision for very large integers
+                // Covers u64 > i64::MAX — loses precision for very large integers.
+                // This is acceptable: Kuzu uses INT64 (max 2^63-1), so values > i64::MAX
+                // can't be stored anyway. All values in [0, i64::MAX] are handled by
+                // as_i64() above with no precision loss.
                 ParamValue::Float(f)
             } else {
                 // Should be unreachable — serde_json numbers are always i64, u64, or f64
@@ -293,11 +296,24 @@ mod tests {
 
     #[test]
     fn test_param_value_large_u64_becomes_float() {
-        // u64::MAX can't fit in i64 → falls through to f64
+        // u64::MAX can't fit in i64 → falls through to f64.
+        // Acceptable: Kuzu uses INT64 (max i64::MAX), so these values
+        // can't be stored in Kuzu anyway.
         let val = json!(u64::MAX);
         match json_to_param_value(&val) {
             ParamValue::Float(f) => assert!(f > 0.0),
             other => panic!("Expected Float for large u64, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_param_value_i64_max_is_exact_int() {
+        // i64::MAX (2^63-1) is the largest value Kuzu INT64 can store.
+        // Verify it's handled as Int (exact), not Float (lossy).
+        let val = json!(i64::MAX);
+        match json_to_param_value(&val) {
+            ParamValue::Int(i) => assert_eq!(i, i64::MAX),
+            other => panic!("Expected Int for i64::MAX, got {:?}", other),
         }
     }
 

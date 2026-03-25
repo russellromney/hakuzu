@@ -4,7 +4,7 @@
 //! graphstream JournalReader, and replays against local Kuzu via replay_entries.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +31,10 @@ pub struct KuzuFollowerBehavior {
     write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
     /// Snapshot lock — held (read) during replay to prevent snapshots mid-replay.
     snapshot_lock: Option<Arc<std::sync::RwLock<()>>>,
+    /// Shared with HaKuzuInner — true when last poll found no new segments.
+    caught_up: Arc<AtomicBool>,
+    /// Shared with HaKuzuInner — last successfully replayed sequence number.
+    replay_position: Arc<AtomicU64>,
 }
 
 impl KuzuFollowerBehavior {
@@ -41,7 +45,14 @@ impl KuzuFollowerBehavior {
             shared_db: None,
             write_mutex: None,
             snapshot_lock: None,
+            caught_up: Arc::new(AtomicBool::new(false)),
+            replay_position: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Get shared references for threading into HaKuzuInner.
+    pub fn readiness_state(&self) -> (Arc<AtomicBool>, Arc<AtomicU64>) {
+        (self.caught_up.clone(), self.replay_position.clone())
     }
 
     /// Use a shared Database for replay instead of creating a new one per replay.
@@ -98,9 +109,11 @@ impl FollowerBehavior for KuzuFollowerBehavior {
 
                     match downloaded {
                         Ok(segments) if segments.is_empty() => {
+                            self.caught_up.store(true, Ordering::SeqCst);
                             metrics.inc(&metrics.follower_pulls_no_new_data);
                         }
                         Ok(_segments) => {
+                            self.caught_up.store(false, Ordering::SeqCst);
                             // 2. Replay entries against local Kuzu.
                             // Hold write_mutex + snapshot_lock during replay to prevent
                             // concurrent reads from seeing partial replay state.
@@ -139,8 +152,13 @@ impl FollowerBehavior for KuzuFollowerBehavior {
                                             db_name, current_seq, new_seq
                                         );
                                         position.store(new_seq, Ordering::SeqCst);
+                                        self.replay_position.store(new_seq, Ordering::SeqCst);
                                         metrics.inc(&metrics.follower_pulls_succeeded);
                                     }
+                                    // Always mark caught up after successful replay,
+                                    // even if new_seq == current_seq (already-replayed
+                                    // segments after crash recovery).
+                                    self.caught_up.store(true, Ordering::SeqCst);
                                 }
                                 Ok(Err(e)) => {
                                     tracing::error!("Follower '{}': replay failed: {}", db_name, e);
@@ -220,6 +238,10 @@ impl FollowerBehavior for KuzuFollowerBehavior {
         .await
         .map_err(|e| anyhow::anyhow!("Catchup task panic: {e}"))?
         .map_err(|e| anyhow::anyhow!("Catchup replay failed: {e}"))?;
+
+        if new_seq > position {
+            self.replay_position.store(new_seq, Ordering::SeqCst);
+        }
 
         tracing::info!(
             "KuzuFollowerBehavior '{}': caught up seq {} → {}",
