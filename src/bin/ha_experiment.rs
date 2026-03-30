@@ -380,7 +380,8 @@ async fn main() -> Result<()> {
     );
 
     // Join the HA cluster.
-    let role = coordinator.join("graph", &args.db).await?;
+    let join_result = coordinator.join("graph", &args.db).await?;
+    let role = join_result.role;
     info!("*** THIS INSTANCE IS THE {} ***", role);
 
     // Spawn role event listener.

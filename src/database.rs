@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use axum::routing::post;
 use graphstream::journal::{JournalCommand, JournalSender, PendingEntry};
-use hadb::{Coordinator, CoordinatorConfig, LeaseConfig, Role, RoleEvent};
+use hadb::{Coordinator, CoordinatorConfig, JoinResult, LeaseConfig, Role, RoleEvent};
 use hadb_lease_s3::S3LeaseStore;
 
 use crate::error::HakuzuError;
@@ -276,11 +276,11 @@ impl HaKuzuBuilder {
 
         // Build follower behavior — shares locks with HaKuzuInner for replay serialization.
         let follower_s3 = aws_sdk_s3::Client::new(&s3_config);
-        let follower_behavior = KuzuFollowerBehavior::new(follower_s3, self.bucket.clone())
-            .with_shared_db(db.clone())
-            .with_locks(write_mutex.clone(), snapshot_lock.clone());
-        let (follower_caught_up, follower_replay_position) = follower_behavior.readiness_state();
-        let follower_behavior = Arc::new(follower_behavior);
+        let follower_behavior = Arc::new(
+            KuzuFollowerBehavior::new(follower_s3, self.bucket.clone())
+                .with_shared_db(db.clone())
+                .with_locks(write_mutex.clone(), snapshot_lock.clone()),
+        );
 
         // Build snapshot context for leader.
         let snapshot_ctx = self.snapshot_interval.map(|interval| SnapshotContext {
@@ -322,7 +322,6 @@ impl HaKuzuBuilder {
             snapshot_ctx,
             Some((write_mutex, snapshot_lock)),
             self.read_concurrency,
-            Some((follower_caught_up, follower_replay_position)),
         )
         .await
     }
@@ -556,7 +555,6 @@ impl HaKuzu {
             None, // no snapshot config via from_coordinator
             None, // no pre-created locks
             DEFAULT_READ_CONCURRENCY,
-            None, // no follower readiness state (tests build their own behavior)
         )
         .await
     }
@@ -902,13 +900,14 @@ async fn open_with_coordinator(
     snapshot_ctx: Option<SnapshotContext>,
     locks: Option<(Arc<tokio::sync::Mutex<()>>, Arc<std::sync::RwLock<()>>)>,
     read_concurrency: usize,
-    readiness: Option<(Arc<AtomicBool>, Arc<AtomicU64>)>,
 ) -> Result<HaKuzu> {
     // Subscribe to role events BEFORE join.
     let role_rx = coordinator.role_events();
 
-    // Join the HA cluster.
-    let initial_role = coordinator.join(db_name, &db_path).await?;
+    // Join the HA cluster. JoinResult contains Arc refs to the coordinator's
+    // per-database atomics for zero-overhead health checks.
+    let JoinResult { role: initial_role, caught_up: follower_caught_up, position: follower_replay_position } =
+        coordinator.join(db_name, &db_path).await?;
 
     let leader_addr = if initial_role == Role::Leader {
         address.to_string()
@@ -930,12 +929,6 @@ async fn open_with_coordinator(
             Arc::new(tokio::sync::Mutex::new(())),
             Arc::new(std::sync::RwLock::new(())),
         )
-    });
-
-    let (follower_caught_up, follower_replay_position) = readiness.unwrap_or_else(|| {
-        let caught_up = Arc::new(AtomicBool::new(initial_role == Role::Leader));
-        let replay_pos = Arc::new(AtomicU64::new(0));
-        (caught_up, replay_pos)
     });
 
     let inner = Arc::new(HaKuzuInner {

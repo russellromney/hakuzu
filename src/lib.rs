@@ -39,7 +39,7 @@ pub use follower_behavior::KuzuFollowerBehavior;
 
 // Re-export hadb types.
 pub use hadb::{
-    Coordinator, CoordinatorConfig, HaMetrics, InMemoryLeaseStore, LeaseConfig,
+    Coordinator, CoordinatorConfig, HaMetrics, InMemoryLeaseStore, JoinResult, LeaseConfig,
     LeaseData, LeaseStore, MetricsSnapshot, NodeRegistration, NodeRegistry, Role, RoleEvent,
 };
 
