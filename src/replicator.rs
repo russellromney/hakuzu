@@ -206,9 +206,40 @@ impl Replicator for KuzuReplicator {
 
             if let Some(path) = &sealed {
                 tracing::info!("KuzuReplicator: synced (sealed {})", path.display());
-                // Trigger immediate upload of the sealed segment.
-                if state.upload_tx.send(UploadMessage::Upload(path.clone())).await.is_err() {
+                // Trigger immediate upload and wait for confirmation.
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                if state
+                    .upload_tx
+                    .send(UploadMessage::UploadWithAck(path.clone(), ack_tx))
+                    .await
+                    .is_err()
+                {
                     tracing::error!("KuzuReplicator: upload channel closed for '{}'", name);
+                } else {
+                    // Wait for upload to complete.
+                    match ack_rx.await {
+                        Ok(Ok(())) => {
+                            tracing::info!(
+                                "KuzuReplicator: sync upload confirmed for '{}'",
+                                name
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                "KuzuReplicator: sync upload failed for '{}': {}",
+                                name,
+                                e
+                            );
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                "KuzuReplicator: upload ack channel dropped for '{}'",
+                                name
+                            );
+                            return Err(anyhow::anyhow!("Upload ack channel dropped"));
+                        }
+                    }
                 }
             }
         }
