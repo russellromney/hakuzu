@@ -100,10 +100,12 @@ impl FollowerBehavior for KuzuFollowerBehavior {
                     match downloaded {
                         Ok(segments) if segments.is_empty() => {
                             caught_up.store(true, Ordering::SeqCst);
+                            metrics.follower_caught_up.store(1, Ordering::Relaxed);
                             metrics.inc(&metrics.follower_pulls_no_new_data);
                         }
                         Ok(_segments) => {
                             caught_up.store(false, Ordering::SeqCst);
+                            metrics.follower_caught_up.store(0, Ordering::Relaxed);
                             // 2. Replay entries against local Kuzu.
                             // Hold write_mutex + snapshot_lock during replay to prevent
                             // concurrent reads from seeing partial replay state.
@@ -142,12 +144,14 @@ impl FollowerBehavior for KuzuFollowerBehavior {
                                             db_name, current_seq, new_seq
                                         );
                                         position.store(new_seq, Ordering::SeqCst);
+                                        metrics.follower_replay_position.store(new_seq, Ordering::Relaxed);
                                         metrics.inc(&metrics.follower_pulls_succeeded);
                                     }
                                     // Always mark caught up after successful replay,
                                     // even if new_seq == current_seq (already-replayed
                                     // segments after crash recovery).
                                     caught_up.store(true, Ordering::SeqCst);
+                                    metrics.follower_caught_up.store(1, Ordering::Relaxed);
                                 }
                                 Ok(Err(e)) => {
                                     tracing::error!("Follower '{}': replay failed: {}", db_name, e);
