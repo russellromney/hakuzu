@@ -1,6 +1,6 @@
 # hakuzu
 
-> **Experimental.** hakuzu is under active development and not yet stable. APIs will change without notice.
+> **Pre-1.0.** APIs may change between minor versions.
 
 HA Kuzu/LadybugDB with one line of code. Leader election, journal replication, write forwarding — just your app + an S3 bucket.
 
@@ -61,9 +61,10 @@ let db = HaKuzu::local("/data/graph", "CREATE NODE TABLE IF NOT EXISTS ...")?;
 
 ## Dependencies
 
-- [hadb](https://github.com/russellromney/hadb) — Database-agnostic HA coordination (uses `hadb-lease-s3` for S3 leases)
-- [graphstream](https://github.com/russellromney/graphstream) — Journal replication for graph databases
-- [lbug](https://github.com/Vela-Engineering/ladybug) — Rust bindings for LadybugDB/Kuzu
+- [hadb](https://github.com/russellromney/hadb) -- HA coordination (leader election, follower readiness, pluggable LeaseStore)
+- [hadb-io](https://github.com/russellromney/hadb/tree/main/hadb-io) -- ObjectStore trait, S3 backend, retry, circuit breaker
+- [graphstream](https://github.com/russellromney/graphstream) -- Journal replication via ObjectStore (hadb-io migration complete)
+- [lbug](https://github.com/Vela-Engineering/ladybug) -- Rust bindings for LadybugDB/Kuzu
 
 ### macOS: ladybug-fork required
 
