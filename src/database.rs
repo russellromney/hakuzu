@@ -260,8 +260,13 @@ impl HaKuzuBuilder {
 
         let lease_store = Arc::new(S3LeaseStore::new(s3_client.clone(), self.bucket.clone()));
 
+        // Build shared ObjectStore for replicator + follower behavior.
+        let object_store: Arc<dyn hadb_io::ObjectStore> = Arc::new(
+            hadb_io::S3Backend::new(s3_client.clone(), self.bucket.clone()),
+        );
+
         // Build replicator.
-        let mut replicator = KuzuReplicator::new(self.bucket.clone(), self.prefix.clone());
+        let mut replicator = KuzuReplicator::new(object_store.clone(), self.prefix.clone());
         if let Some(interval) = self.upload_interval {
             replicator = replicator.with_upload_interval(interval);
         }
@@ -275,9 +280,8 @@ impl HaKuzuBuilder {
         let snapshot_lock = Arc::new(std::sync::RwLock::new(()));
 
         // Build follower behavior — shares locks with HaKuzuInner for replay serialization.
-        let follower_s3 = aws_sdk_s3::Client::new(&s3_config);
         let follower_behavior = Arc::new(
-            KuzuFollowerBehavior::new(follower_s3, self.bucket.clone())
+            KuzuFollowerBehavior::new(object_store.clone())
                 .with_shared_db(db.clone())
                 .with_locks(write_mutex.clone(), snapshot_lock.clone()),
         );

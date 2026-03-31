@@ -14,6 +14,8 @@ use hakuzu::{
     KuzuReplicator, LeaseConfig, Role,
 };
 
+mod common;
+
 const SCHEMA: &str = "CREATE NODE TABLE IF NOT EXISTS Person(id INT64, name STRING, PRIMARY KEY(id))";
 
 // ============================================================================
@@ -31,17 +33,13 @@ fn build_coordinator(
         ..Default::default()
     };
 
-    // Use a dummy s3 client — tests don't actually upload to S3.
-    let s3_config = aws_config::SdkConfig::builder()
-        .behavior_version(aws_config::BehaviorVersion::latest())
-        .build();
-    let s3_client = aws_sdk_s3::Client::new(&s3_config);
+    // Use mock object store — tests don't actually upload to S3.
+    let object_store = common::MockObjectStore::new();
     let replicator = Arc::new(
-        KuzuReplicator::new("test-bucket".into(), "test/".into())
-            .with_s3_client(s3_client.clone()),
+        KuzuReplicator::new(object_store.clone(), "test/".into()),
     );
     let follower_behavior = Arc::new(
-        KuzuFollowerBehavior::new(s3_client, "test-bucket".into())
+        KuzuFollowerBehavior::new(object_store)
             .with_shared_db(shared_db),
     );
 

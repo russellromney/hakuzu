@@ -10,6 +10,8 @@ use std::sync::Arc;
 use graphstream::journal::{self, JournalCommand, JournalState, PendingEntry};
 use graphstream::types::ParamValue;
 
+mod common;
+
 /// Write journal entries via graphstream, then replay them against a fresh Kuzu DB.
 #[test]
 fn test_replay_entries() {
@@ -131,7 +133,7 @@ async fn test_replicator_lifecycle() {
 
     // Create replicator (with a dummy bucket — we're testing lifecycle, not S3).
     let replicator = hakuzu::KuzuReplicator::new(
-        "test-bucket".into(),
+        common::MockObjectStore::new(),
         "test/".into(),
     );
 
@@ -391,7 +393,7 @@ fn test_replay_cross_segment() {
 /// KuzuReplicator builder methods.
 #[tokio::test]
 async fn test_replicator_builder_methods() {
-    let replicator = hakuzu::KuzuReplicator::new("bucket".into(), "prefix/".into())
+    let replicator = hakuzu::KuzuReplicator::new(common::MockObjectStore::new(), "prefix/".into())
         .with_segment_max_bytes(2 * 1024 * 1024)
         .with_fsync_ms(50)
         .with_upload_interval(std::time::Duration::from_secs(5));
@@ -418,7 +420,7 @@ async fn test_replicator_sync_seals_segment() {
     let journal_base = dir.path().join("journals");
     std::fs::create_dir_all(&journal_base).unwrap();
 
-    let replicator = hakuzu::KuzuReplicator::new("test-bucket".into(), "test/".into());
+    let replicator = hakuzu::KuzuReplicator::new(common::MockObjectStore::new(), "test/".into());
 
     use hadb::Replicator;
     replicator.add("syncdb", &journal_base).await.expect("add failed");
@@ -454,7 +456,7 @@ async fn test_replicator_multi_db() {
     std::fs::create_dir_all(&journals_a).unwrap();
     std::fs::create_dir_all(&journals_b).unwrap();
 
-    let replicator = hakuzu::KuzuReplicator::new("test-bucket".into(), "test/".into());
+    let replicator = hakuzu::KuzuReplicator::new(common::MockObjectStore::new(), "test/".into());
 
     use hadb::Replicator;
     replicator.add("db_a", &journals_a).await.expect("add a failed");
@@ -503,7 +505,7 @@ async fn test_replicator_multi_db() {
 /// Remove nonexistent database doesn't error.
 #[tokio::test]
 async fn test_replicator_remove_nonexistent() {
-    let replicator = hakuzu::KuzuReplicator::new("test-bucket".into(), "test/".into());
+    let replicator = hakuzu::KuzuReplicator::new(common::MockObjectStore::new(), "test/".into());
 
     use hadb::Replicator;
     // Removing a database that was never added should not error.

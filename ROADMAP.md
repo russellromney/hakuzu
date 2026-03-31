@@ -10,11 +10,18 @@ KuzuReplicator::sync() now uses UploadWithAck and awaits the oneshot response. U
 
 ---
 
-## Phase Cascade: ObjectStore Migration (after graphstream Phase Aether)
+## Phase Cascade: ObjectStore Migration (after graphstream Phase Aether) (DONE)
 
 > After: graphstream Phase Aether · Before: (none)
 
 graphstream Phase Aether changes `download_new_segments` from `(&aws_sdk_s3::Client, &str, ...)` to `(&dyn ObjectStore, ...)`. This breaks hakuzu's `KuzuFollowerBehavior` which calls the function directly (`src/follower_behavior.rs`). hakuzu must update to pass an ObjectStore instead of a raw S3 client.
+
+### Results
+- **KuzuFollowerBehavior**: `s3_client + bucket` replaced by `Arc<dyn ObjectStore>`. Constructor takes one arg instead of two.
+- **KuzuReplicator**: `bucket + s3_client` replaced by `Arc<dyn ObjectStore>`. Removed `with_s3_client()`, `pull()` uses shared ObjectStore directly.
+- **HaKuzuBuilder**: Constructs `S3Backend` from existing S3 client, shares across replicator + follower.
+- **Tests**: MockObjectStore in `tests/common/mod.rs` for non-S3 tests. 176 tests passing (8 files changed, -9 net lines).
+- **Direct S3 deps kept**: `aws-sdk-s3` and `aws-config` still used by snapshot.rs, snapshot_loop.rs, database.rs (S3 config), ha_experiment.rs.
 
 ### Cascade-a: Update KuzuFollowerBehavior to use ObjectStore
 

@@ -31,36 +31,28 @@ struct KuzuDbState {
 ///
 /// Handles journal replication via .graphj files (Kuzu-specific logical format).
 pub struct KuzuReplicator {
-    bucket: String,
     prefix: String,
+    /// ObjectStore for upload + pull operations.
+    object_store: Arc<dyn hadb_io::ObjectStore>,
     /// Segment max bytes before rotation (default 4MB).
     segment_max_bytes: u64,
     /// Fsync interval in ms (default 100ms).
     fsync_ms: u64,
     /// Upload interval (default 10s).
     upload_interval: Duration,
-    /// Optional S3 client for pull(). If None, creates from aws_config defaults.
-    s3_client: Option<aws_sdk_s3::Client>,
     databases: Mutex<HashMap<String, KuzuDbState>>,
 }
 
 impl KuzuReplicator {
-    pub fn new(bucket: String, prefix: String) -> Self {
+    pub fn new(object_store: Arc<dyn hadb_io::ObjectStore>, prefix: String) -> Self {
         Self {
-            bucket,
             prefix,
+            object_store,
             segment_max_bytes: 4 * 1024 * 1024, // 4MB
             fsync_ms: 100,
             upload_interval: Duration::from_secs(10),
-            s3_client: None,
             databases: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Provide an S3 client for pull() operations instead of creating from defaults.
-    pub fn with_s3_client(mut self, client: aws_sdk_s3::Client) -> Self {
-        self.s3_client = Some(client);
-        self
     }
 
     pub fn with_segment_max_bytes(mut self, bytes: u64) -> Self {
@@ -112,13 +104,13 @@ impl Replicator for KuzuReplicator {
             state.clone(),
         );
 
-        // Spawn S3 uploader (concurrent, returns sender + handle).
+        // Spawn uploader (concurrent, returns sender + handle).
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let db_prefix = format!("{}{}/", self.prefix, name);
         let (upload_tx, uploader_handle) = spawn_journal_uploader(
             journal_tx.clone(),
             journal_dir,
-            self.bucket.clone(),
+            self.object_store.clone(),
             db_prefix,
             self.upload_interval,
             shutdown_rx,
@@ -143,17 +135,10 @@ impl Replicator for KuzuReplicator {
         std::fs::create_dir_all(&journal_dir)
             .map_err(|e| anyhow::anyhow!("Failed to create journal dir: {e}"))?;
 
-        // Download all journal segments from S3.
-        let s3_client = match &self.s3_client {
-            Some(client) => client.clone(),
-            None => {
-                let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                aws_sdk_s3::Client::new(&config)
-            }
-        };
+        // Download all journal segments from object store.
         let db_prefix = format!("{}{}/", self.prefix, name);
 
-        match graphstream::download_new_segments(&s3_client, &self.bucket, &db_prefix, &journal_dir, 0).await {
+        match graphstream::download_new_segments(&*self.object_store, &db_prefix, &journal_dir, 0).await {
             Ok(segments) => {
                 tracing::info!("KuzuReplicator: pulled {} journal segments for '{}'", segments.len(), name);
             }

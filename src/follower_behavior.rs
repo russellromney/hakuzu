@@ -24,8 +24,7 @@ use crate::replay;
 /// using graphstream. Holds write_mutex + snapshot_lock during replay
 /// to prevent concurrent reads from seeing partial replay state.
 pub struct KuzuFollowerBehavior {
-    s3_client: aws_sdk_s3::Client,
-    bucket: String,
+    object_store: Arc<dyn hadb_io::ObjectStore>,
     shared_db: Option<Arc<lbug::Database>>,
     /// Write mutex — held during replay to serialize with leader writes.
     write_mutex: Option<Arc<tokio::sync::Mutex<()>>>,
@@ -34,10 +33,9 @@ pub struct KuzuFollowerBehavior {
 }
 
 impl KuzuFollowerBehavior {
-    pub fn new(s3_client: aws_sdk_s3::Client, bucket: String) -> Self {
+    pub fn new(object_store: Arc<dyn hadb_io::ObjectStore>) -> Self {
         Self {
-            s3_client,
-            bucket,
+            object_store,
             shared_db: None,
             write_mutex: None,
             snapshot_lock: None,
@@ -88,10 +86,9 @@ impl FollowerBehavior for KuzuFollowerBehavior {
                 _ = interval.tick() => {
                     let current_seq = position.load(Ordering::SeqCst);
 
-                    // 1. Download new segments from S3.
+                    // 1. Download new segments from object store.
                     let downloaded = graphstream::download_new_segments(
-                        &self.s3_client,
-                        &self.bucket,
+                        &*self.object_store,
                         &db_prefix,
                         &journal_dir,
                         current_seq,
@@ -194,8 +191,7 @@ impl FollowerBehavior for KuzuFollowerBehavior {
 
         // Download latest segments.
         graphstream::download_new_segments(
-            &self.s3_client,
-            &self.bucket,
+            &*self.object_store,
             &db_prefix,
             &journal_dir,
             position,

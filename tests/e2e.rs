@@ -14,14 +14,17 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Create S3 client + bucket + unique prefix from env vars.
-async fn s3_setup() -> (aws_sdk_s3::Client, String, String) {
+/// Create S3 client + ObjectStore + bucket + unique prefix from env vars.
+async fn s3_setup() -> (aws_sdk_s3::Client, Arc<dyn hadb_io::ObjectStore>, String, String) {
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = aws_sdk_s3::Client::new(&config);
     let bucket =
         std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET env var required for e2e tests");
+    let object_store: Arc<dyn hadb_io::ObjectStore> = Arc::new(
+        hadb_io::S3Backend::new(client.clone(), bucket.clone()),
+    );
     let prefix = format!("hakuzu-e2e-{}/", uuid::Uuid::new_v4());
-    (client, bucket, prefix)
+    (client, object_store, bucket, prefix)
 }
 
 /// Manually upload all sealed .graphj files to S3.
@@ -64,12 +67,12 @@ async fn upload_sealed_files(
 #[tokio::test]
 #[ignore]
 async fn test_replicator_uploads_to_s3() {
-    let (client, bucket, prefix) = s3_setup().await;
+    let (client, object_store, bucket, prefix) = s3_setup().await;
     let dir = tempfile::tempdir().unwrap();
     let journal_base = dir.path().join("journals");
 
     // Create replicator with short upload interval.
-    let replicator = hakuzu::KuzuReplicator::new(bucket.clone(), prefix.clone())
+    let replicator = hakuzu::KuzuReplicator::new(object_store.clone(), prefix.clone())
         .with_upload_interval(Duration::from_secs(1))
         .with_segment_max_bytes(1024 * 1024);
 
@@ -131,7 +134,7 @@ async fn test_replicator_uploads_to_s3() {
 #[tokio::test]
 #[ignore]
 async fn test_follower_downloads_and_replays() {
-    let (client, bucket, prefix) = s3_setup().await;
+    let (client, object_store, bucket, prefix) = s3_setup().await;
     let dir = tempfile::tempdir().unwrap();
 
     // === Leader side: write journal entries and upload to S3 ===
@@ -198,8 +201,7 @@ async fn test_follower_downloads_and_replays() {
 
     // Download segments from S3.
     let downloaded = graphstream::download_new_segments(
-        &client,
-        &bucket,
+        &*object_store,
         &db_prefix,
         &follower_journal,
         0,
@@ -229,7 +231,7 @@ async fn test_follower_downloads_and_replays() {
 #[tokio::test]
 #[ignore]
 async fn test_follower_behavior_loop() {
-    let (client, bucket, prefix) = s3_setup().await;
+    let (client, object_store, bucket, prefix) = s3_setup().await;
     let dir = tempfile::tempdir().unwrap();
 
     // === Leader: write entries and upload to S3 ===
@@ -294,7 +296,7 @@ async fn test_follower_behavior_loop() {
     }
 
     // Create follower behavior and run one poll iteration via catchup_on_promotion.
-    let follower = hakuzu::KuzuFollowerBehavior::new(client.clone(), bucket.clone());
+    let follower = hakuzu::KuzuFollowerBehavior::new(object_store.clone());
 
     use hadb::FollowerBehavior;
     follower
@@ -319,7 +321,7 @@ async fn test_follower_behavior_loop() {
 #[tokio::test]
 #[ignore]
 async fn test_replicator_pull_from_s3() {
-    let (client, bucket, prefix) = s3_setup().await;
+    let (client, object_store, bucket, prefix) = s3_setup().await;
     let dir = tempfile::tempdir().unwrap();
 
     // Upload journal segments to S3 first.
@@ -362,7 +364,7 @@ async fn test_replicator_pull_from_s3() {
     std::fs::create_dir_all(&follower_base).unwrap();
     let follower_db_path = follower_base.join("db");
 
-    let replicator = hakuzu::KuzuReplicator::new(bucket.clone(), prefix.clone());
+    let replicator = hakuzu::KuzuReplicator::new(object_store.clone(), prefix.clone());
     use hadb::Replicator;
     replicator.pull("graph", &follower_db_path).await.unwrap();
 

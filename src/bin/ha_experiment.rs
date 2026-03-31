@@ -340,21 +340,24 @@ async fn main() -> Result<()> {
         info!("Schema applied");
     }
 
-    // Build S3 client.
+    // Build S3 client + ObjectStore.
     let s3_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let s3_client = aws_sdk_s3::Client::new(&s3_config);
+    let object_store: Arc<dyn hadb_io::ObjectStore> = Arc::new(
+        hadb_io::S3Backend::new(s3_client.clone(), args.bucket.clone()),
+    );
 
     // Create HA components.
     let lease_store: Arc<dyn hadb::LeaseStore> =
         Arc::new(S3LeaseStore::new(s3_client.clone(), args.bucket.clone()));
 
     let replicator = Arc::new(
-        KuzuReplicator::new(args.bucket.clone(), args.prefix.clone())
+        KuzuReplicator::new(object_store.clone(), args.prefix.clone())
             .with_upload_interval(Duration::from_millis(args.sync_interval_ms)),
     );
 
     let follower_behavior: Arc<dyn hadb::FollowerBehavior> = Arc::new(
-        KuzuFollowerBehavior::new(s3_client, args.bucket.clone())
+        KuzuFollowerBehavior::new(object_store)
             .with_shared_db(shared_db.clone()),
     );
 
