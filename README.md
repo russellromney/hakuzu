@@ -1,6 +1,6 @@
 # hakuzu
 
-> **Pre-1.0.** APIs may change between minor versions.
+> **Experimental.** hakuzu is under active development and not yet stable. APIs will change without notice.
 
 HA Kuzu/LadybugDB with one line of code. Leader election, journal replication, write forwarding — just your app + an S3 bucket.
 
