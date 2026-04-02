@@ -1,6 +1,6 @@
 [package]
 name = "hakuzu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "HA Kuzu/LadybugDB with one line of code. Leader election, journal replication, write forwarding — just your app + an S3 bucket."
 authors = ["Russell Romney <russellromney@gmail.com>"]
@@ -11,12 +11,12 @@ categories = ["database", "network-programming"]
 
 [dependencies]
 # HA coordination framework
-hadb = { path = "../hadb/hadb" }
-hadb-io = { path = "../hadb/hadb-io", features = ["s3"] }
-hadb-lease-s3 = { path = "../hadb/hadb-lease-s3" }
+hadb = { path = "../hadb/hadb", version = "0.2" }
+hadb-io = { path = "../hadb/hadb-io", version = "0.2", features = ["s3"] }
+hadb-lease-s3 = { path = "../hadb/hadb-lease-s3", version = "0.2" }
 
 # Journal replication
-graphstream = { path = "../graphstream" }
+graphstream = { path = "../graphstream", version = "0.2" }
 
 # Kuzu graph database
 lbug = { version = "0.14", default-features = false }
