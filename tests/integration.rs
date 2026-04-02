@@ -369,7 +369,7 @@ fn test_replay_cross_segment() {
         .unwrap()
         .filter(|e| {
             e.as_ref().unwrap().path().extension()
-                .map_or(false, |ext| ext == "graphj")
+                .map_or(false, |ext| ext == "hadbj")
         })
         .count();
     assert!(segment_count > 1, "Expected multiple segments, got {segment_count}");

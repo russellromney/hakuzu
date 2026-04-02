@@ -9,7 +9,8 @@
 //!     cargo test --test e2e -- --ignored
 
 use graphstream::journal::{self, JournalCommand, JournalState, PendingEntry};
-use graphstream::graphj;
+use hadb_changeset::journal::{decode_header, HADBJ_MAGIC, HEADER_SIZE};
+use hadb_changeset::storage::{format_key, ChangesetKind, GENERATION_INCREMENTAL};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,27 +28,30 @@ async fn s3_setup() -> (aws_sdk_s3::Client, Arc<dyn hadb_io::ObjectStore>, Strin
     (client, object_store, bucket, prefix)
 }
 
-/// Manually upload all sealed .graphj files to S3.
+/// Manually upload all sealed .hadbj files to S3 using format_key layout.
 async fn upload_sealed_files(
     client: &aws_sdk_s3::Client,
     journal_dir: &std::path::Path,
     bucket: &str,
     prefix: &str,
+    db_name: &str,
 ) {
     for entry in std::fs::read_dir(journal_dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
         let name = path.file_name().unwrap().to_str().unwrap();
-        if !name.ends_with(".graphj") {
+        if !name.ends_with(".hadbj") {
             continue;
         }
-        let mut f = std::fs::File::open(&path).unwrap();
-        let header = graphj::read_header(&mut f).unwrap();
-        if header.map_or(true, |h| !h.is_sealed()) {
-            continue;
-        }
-        let key = format!("{}journal/{}", prefix, name);
         let bytes = std::fs::read(&path).unwrap();
+        if bytes.len() < HEADER_SIZE || bytes[0..5] != HADBJ_MAGIC {
+            continue;
+        }
+        let header = decode_header(&bytes).unwrap();
+        if !header.is_sealed() {
+            continue;
+        }
+        let key = format_key(prefix, db_name, GENERATION_INCREMENTAL, header.first_seq, ChangesetKind::Journal);
         client
             .put_object()
             .bucket(bucket)
@@ -101,8 +105,8 @@ async fn test_replicator_uploads_to_s3() {
     // Wait for uploader to upload (interval is 1s, wait 3s).
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Verify segments on S3.
-    let journal_prefix = format!("{}graph/journal/", prefix);
+    // Verify segments on S3 (format_key layout: {prefix}{db_name}/0000/*.hadbj).
+    let journal_prefix = format!("{}graph/", prefix);
     let list_resp = client
         .list_objects_v2()
         .bucket(&bucket)
@@ -181,8 +185,7 @@ async fn test_follower_downloads_and_replays() {
     std::thread::sleep(Duration::from_millis(100));
 
     // Upload leader segments to S3 under the db-specific prefix.
-    let db_prefix = format!("{}graph/", prefix);
-    upload_sealed_files(&client, &leader_journal, &bucket, &db_prefix).await;
+    upload_sealed_files(&client, &leader_journal, &bucket, &prefix, "graph").await;
 
     // === Follower side: download from S3 and replay against Kuzu ===
     // Keep journal separate from DB path (Kuzu doesn't like extra dirs inside its DB).
@@ -202,7 +205,8 @@ async fn test_follower_downloads_and_replays() {
     // Download segments from S3.
     let downloaded = graphstream::download_new_segments(
         &*object_store,
-        &db_prefix,
+        &prefix,
+        "graph",
         &follower_journal,
         0,
     )
@@ -275,8 +279,7 @@ async fn test_follower_behavior_loop() {
     tx.send(JournalCommand::Shutdown).unwrap();
     std::thread::sleep(Duration::from_millis(100));
 
-    let db_prefix = format!("{}graph/", prefix);
-    upload_sealed_files(&client, &leader_journal, &bucket, &db_prefix).await;
+    upload_sealed_files(&client, &leader_journal, &bucket, &prefix, "graph").await;
 
     // === Follower: set up Kuzu DB + run follower behavior ===
     // Note: catchup_on_promotion creates journal at db_path.join("journal"),
@@ -355,8 +358,7 @@ async fn test_replicator_pull_from_s3() {
     tx.send(JournalCommand::Shutdown).unwrap();
     std::thread::sleep(Duration::from_millis(100));
 
-    let db_prefix = format!("{}graph/", prefix);
-    upload_sealed_files(&client, &leader_journal, &bucket, &db_prefix).await;
+    upload_sealed_files(&client, &leader_journal, &bucket, &prefix, "graph").await;
 
     // Use replicator.pull() to download.
     // pull() treats `path` as a db path and creates journal at path.parent()/journal/.
@@ -376,7 +378,7 @@ async fn test_replicator_pull_from_s3() {
         .filter(|e| {
             e.path()
                 .extension()
-                .map_or(false, |ext| ext == "graphj")
+                .map_or(false, |ext| ext == "hadbj")
         })
         .collect();
     assert!(!files.is_empty(), "Expected downloaded journal segments");

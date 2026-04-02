@@ -106,12 +106,12 @@ impl Replicator for KuzuReplicator {
 
         // Spawn uploader (concurrent, returns sender + handle).
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let db_prefix = format!("{}{}/", self.prefix, name);
         let (upload_tx, uploader_handle) = spawn_journal_uploader(
             journal_tx.clone(),
             journal_dir,
             self.object_store.clone(),
-            db_prefix,
+            self.prefix.clone(),
+            name.to_string(),
             self.upload_interval,
             shutdown_rx,
         );
@@ -136,9 +136,7 @@ impl Replicator for KuzuReplicator {
             .map_err(|e| anyhow::anyhow!("Failed to create journal dir: {e}"))?;
 
         // Download all journal segments from object store.
-        let db_prefix = format!("{}{}/", self.prefix, name);
-
-        match graphstream::download_new_segments(&*self.object_store, &db_prefix, &journal_dir, 0).await {
+        match graphstream::download_new_segments(&*self.object_store, &self.prefix, name, &journal_dir, 0).await {
             Ok(segments) => {
                 tracing::info!("KuzuReplicator: pulled {} journal segments for '{}'", segments.len(), name);
             }

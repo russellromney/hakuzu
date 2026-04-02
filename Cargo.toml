@@ -86,6 +86,7 @@ serde_json = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 filetime = "0.2"
+hadb-changeset = "0.3"
 
 [patch.crates-io]
-lbug = { path = "../personal-website/ladybug-fork/tools/rust_api" }
+lbug = { path = "../ladybug-fork/tools/rust_api" }

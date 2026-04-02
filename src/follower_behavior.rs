@@ -79,7 +79,6 @@ impl FollowerBehavior for KuzuFollowerBehavior {
     ) -> Result<()> {
         let mut interval = tokio::time::interval(poll_interval);
         let journal_dir = db_path.parent().unwrap_or(db_path.as_path()).join("journal");
-        let db_prefix = format!("{}{}/", prefix, db_name);
 
         loop {
             tokio::select! {
@@ -89,7 +88,8 @@ impl FollowerBehavior for KuzuFollowerBehavior {
                     // 1. Download new segments from object store.
                     let downloaded = graphstream::download_new_segments(
                         &*self.object_store,
-                        &db_prefix,
+                        prefix,
+                        db_name,
                         &journal_dir,
                         current_seq,
                     ).await;
@@ -183,7 +183,6 @@ impl FollowerBehavior for KuzuFollowerBehavior {
         position: u64,
     ) -> Result<()> {
         let journal_dir = db_path.parent().unwrap_or(db_path.as_path()).join("journal");
-        let db_prefix = format!("{}{}/", prefix, db_name);
 
         // Note: snapshot-based bootstrap happens in HaKuzuBuilder::open() on cold
         // start. Here the database is already open, so we can only replay journal
@@ -192,7 +191,8 @@ impl FollowerBehavior for KuzuFollowerBehavior {
         // Download latest segments.
         graphstream::download_new_segments(
             &*self.object_store,
-            &db_prefix,
+            prefix,
+            db_name,
             &journal_dir,
             position,
         )
