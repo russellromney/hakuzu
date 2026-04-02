@@ -22,7 +22,7 @@ use hadb::Replicator;
 struct KuzuDbState {
     journal_tx: JournalSender,
     journal_state: Arc<JournalState>,
-    upload_tx: tokio::sync::mpsc::Sender<UploadMessage>,
+    upload_tx: tokio::sync::mpsc::Sender<UploadMessage<std::path::PathBuf>>,
     uploader_handle: JoinHandle<()>,
     uploader_shutdown: tokio::sync::watch::Sender<bool>,
 }
