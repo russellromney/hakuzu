@@ -29,7 +29,7 @@ struct KuzuDbState {
 
 /// Kuzu replicator wrapping graphstream.
 ///
-/// Handles journal replication via .graphj files (Kuzu-specific logical format).
+/// Handles journal replication via .hadbj files (hadb-changeset binary format).
 pub struct KuzuReplicator {
     prefix: String,
     /// ObjectStore for upload + pull operations.

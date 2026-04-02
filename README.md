@@ -51,7 +51,7 @@ let db = HaKuzu::local("/data/graph", "CREATE NODE TABLE IF NOT EXISTS ...")?;
 - **Single-writer**: Kuzu is single-writer. `write_mutex` serializes all writes; shared with follower replay via `Arc`.
 - **Connection-per-operation**: `lbug::Connection` is NOT Send. Created per-operation inside `spawn_blocking`, dropped within.
 - **Deterministic rewriter**: Non-deterministic Cypher functions rewritten to concrete parameter values before execution and journaling, ensuring followers replay identical results.
-- **Journal replication**: Writes are journaled via graphstream `.graphj` segments, uploaded to S3, replayed by followers.
+- **Journal replication**: Writes are journaled via graphstream `.hadbj` segments (hadb-changeset binary format), uploaded to S3, replayed by followers.
 - **Snapshot bootstrap**: Leader periodically creates tar.zst snapshots of the Kuzu database, uploads to S3. New nodes download the latest snapshot on startup, skipping full replay.
 - **Leader election**: hadb Coordinator handles leader election via S3 CAS leases, automatic failover.
 - **Write forwarding**: Followers auto-forward mutations to the leader via HTTP with Bearer auth.
