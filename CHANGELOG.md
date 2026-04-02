@@ -1,5 +1,25 @@
 # hakuzu Changelog
 
+## Phase Cascade: ObjectStore Migration
+
+Migrated hakuzu from raw S3 client to `ObjectStore` trait (aligned with graphstream Phase Aether).
+
+- `KuzuFollowerBehavior`: `s3_client + bucket` replaced by `Arc<dyn ObjectStore>`. Constructor takes one arg instead of two.
+- `KuzuReplicator`: `bucket + s3_client` replaced by `Arc<dyn ObjectStore>`. Removed `with_s3_client()`, `pull()` uses shared ObjectStore directly.
+- `HaKuzuBuilder`: Constructs `S3Backend` from existing S3 client, shares across replicator + follower.
+- `MockObjectStore` added in `tests/common/mod.rs` for non-S3 tests.
+- Direct S3 deps (`aws-sdk-s3`, `aws-config`) still used by snapshot.rs, snapshot_loop.rs, database.rs, ha_experiment.rs.
+
+176 tests passing (8 files changed, -9 net lines).
+
+## Phase Drain: Synchronous Upload Ack
+
+`KuzuReplicator::sync()` now uses `UploadWithAck` and awaits the oneshot response. Upload errors propagate instead of silent fire-and-forget. `HaMetrics` follower_caught_up/replay_position gauges wired.
+
+## Phase Parity: Delegate Readiness to hadb Coordinator
+
+Deleted local caught_up/replay_position from `KuzuFollowerBehavior`, repointed to coordinator-owned atomics via `JoinResult`. Deleted `readiness_state()` method. Atomic with hadb Phase Beacon and haqlite Phase Rampart-e.
+
 ## Phase 10: Follower Readiness & Edge Cases
 
 ### Follower readiness API
