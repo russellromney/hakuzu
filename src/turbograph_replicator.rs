@@ -84,8 +84,8 @@ impl TurbographReplicator {
     /// Call turbograph_get_manifest() via lbug connection (Phase GraphBridge).
     ///
     /// Returns the current manifest as a JSON string in turbograph's internal
-    /// format. This is the opaque blob that gets stored in manifest_json and
-    /// passed to turbograph_set_manifest() on followers.
+    /// format. Parsed into structured StorageManifest::Turbograph fields by the
+    /// leader, then reconstructed to JSON on the follower for turbograph_set_manifest().
     fn call_get_manifest(&self) -> Result<String> {
         let conn = lbug::Connection::new(&self.db)
             .map_err(|e| anyhow!("turbograph_replicator: failed to create connection: {e}"))?;
@@ -107,9 +107,8 @@ impl Replicator for TurbographReplicator {
 
     /// Pull the latest manifest from ManifestStore and apply via turbograph_set_manifest.
     ///
-    /// Extracts the `manifest_json` field from StorageManifest::Turbograph (the raw
-    /// turbograph-internal JSON) and passes it directly to the UDF. This is the
-    /// correct format that Manifest::fromJSON() expects on the C++ side.
+    /// Reconstructs turbograph's internal JSON from the structured
+    /// StorageManifest::Turbograph fields and passes it to the UDF.
     async fn pull(&self, name: &str, _path: &Path) -> Result<()> {
         let store = self.manifest_store.as_ref().ok_or_else(|| {
             anyhow!("TurbographReplicator: pull requires a ManifestStore (set via with_manifest_store)")
@@ -161,7 +160,8 @@ impl Replicator for TurbographReplicator {
             let replicator = TurbographReplicator { db, manifest_store: None };
             let version = replicator.call_sync()?;
             // Read the full manifest JSON after sync so we can populate structured fields.
-            let json = replicator.call_get_manifest().unwrap_or_default();
+            // If the UDF isn't available (extension too old), returns Err.
+            let json = replicator.call_get_manifest();
             Ok::<_, anyhow::Error>((version, json))
         })
         .await
@@ -177,6 +177,22 @@ impl Replicator for TurbographReplicator {
         // Parse the turbograph JSON into structured fields. Followers reconstruct
         // the JSON from these fields (no opaque blob stored in msgpack).
         if let Some(ref store) = self.manifest_store {
+            let manifest_json = match manifest_json {
+                Ok(json) => json,
+                Err(e) => {
+                    // turbograph_get_manifest() unavailable (extension too old).
+                    // The sync itself succeeded (data is durable in S3). Skip
+                    // ManifestStore publication; followers can't discover this
+                    // version until the extension is upgraded.
+                    tracing::error!(
+                        "TurbographReplicator: turbograph_get_manifest() failed for '{}': {}. \
+                         Skipping ManifestStore publication (data is still durable in S3).",
+                        name, e,
+                    );
+                    return Ok(());
+                }
+            };
+
             let current = store.get(name).await?;
             let expected_version = current.as_ref().map(|m| m.version);
 

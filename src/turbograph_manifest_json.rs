@@ -28,6 +28,11 @@ use anyhow::{anyhow, Result};
 use hadb::{HaManifest, StorageManifest};
 use hadb::manifest::{FrameEntry, SubframeOverride};
 
+/// JSON-escape a string value (wraps in quotes, escapes special chars).
+fn json_escape_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s))
+}
+
 /// Reconstruct turbograph's internal JSON from StorageManifest::Turbograph fields.
 ///
 /// Produces the exact format that `Manifest::fromJSON()` on the C++ side expects.
@@ -76,13 +81,11 @@ pub fn to_turbograph_json(storage: &StorageManifest) -> Result<String> {
         turbograph_version, page_count, page_size, pages_per_group,
     );
 
-    // page_group_keys
+    // page_group_keys (JSON-escape values to handle special chars)
     json.push_str(",\"page_group_keys\":[");
     for (i, key) in page_group_keys.iter().enumerate() {
         if i > 0 { json.push(','); }
-        json.push('"');
-        json.push_str(key);
-        json.push('"');
+        json.push_str(&json_escape_string(key));
     }
     json.push(']');
 
@@ -121,8 +124,12 @@ pub fn to_turbograph_json(storage: &StorageManifest) -> Result<String> {
                     if !first { json.push(','); }
                     first = false;
                     json.push_str(&format!(
-                        "\"{}\":{{\"key\":\"{}\",\"offset\":{},\"len\":{},\"pageCount\":{}}}",
-                        frame_idx, ov.key, ov.entry.offset, ov.entry.len, ov.entry.page_count,
+                        "\"{}\":{{\"key\":{},\"offset\":{},\"len\":{},\"pageCount\":{}}}",
+                        frame_idx,
+                        json_escape_string(&ov.key),
+                        ov.entry.offset,
+                        ov.entry.len,
+                        ov.entry.page_count,
                     ));
                 }
                 json.push('}');
@@ -339,6 +346,29 @@ mod tests {
         } else {
             panic!("expected Turbograph variant");
         }
+    }
+
+    #[test]
+    fn keys_with_special_chars_escaped() {
+        let storage = StorageManifest::Turbograph {
+            turbograph_version: 1,
+            page_count: 10,
+            page_size: 4096,
+            pages_per_group: 4096,
+            sub_pages_per_frame: 0,
+            page_group_keys: vec!["pg/with\"quote".into(), "pg/with\\slash".into()],
+            frame_tables: vec![],
+            subframe_overrides: vec![],
+            encrypted: false,
+            journal_seq: 0,
+        };
+        let json = to_turbograph_json(&storage).unwrap();
+        // Verify the JSON is valid by parsing it.
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("JSON should be valid even with special chars in keys");
+        let keys = parsed["page_group_keys"].as_array().unwrap();
+        assert_eq!(keys[0].as_str().unwrap(), "pg/with\"quote");
+        assert_eq!(keys[1].as_str().unwrap(), "pg/with\\slash");
     }
 
     #[test]
