@@ -196,6 +196,7 @@ impl HaKuzuInner {
                         .map_err(|e| anyhow!("turbograph_sync after write failed: {e}"))?;
                 }
             }
+            Durability::Eventual => unreachable!("hakuzu does not support Eventual durability"),
         }
 
         self.metrics.inc(&self.metrics.writes_total);

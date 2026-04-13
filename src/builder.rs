@@ -215,6 +215,13 @@ impl HaKuzuBuilder {
             return Err(anyhow!("Shared mode not yet implemented in hakuzu"));
         }
 
+        if matches!(self.durability, Durability::Eventual) {
+            return Err(anyhow!(
+                "Durability::Eventual is not supported by hakuzu \
+                 (graph databases use Replicated or Synchronous)"
+            ));
+        }
+
         // External database requires external locks to prevent data races.
         // Without shared locks, hakuzu creates independent locks, meaning two lock
         // systems protect the same database (the caller's and hakuzu's).
@@ -358,6 +365,7 @@ impl HaKuzuBuilder {
                     }
                     (Arc::new(tr), None)
                 }
+                Durability::Eventual => unreachable!("rejected above"),
             };
 
         // Create or use pre-provided locks.
@@ -396,6 +404,7 @@ impl HaKuzuBuilder {
                     );
                     (fb, Some(notify))
                 }
+                Durability::Eventual => unreachable!("rejected above"),
             };
 
         // Snapshot loop only makes sense for Replicated durability.
@@ -416,6 +425,7 @@ impl HaKuzuBuilder {
                 })
             }
             Durability::Synchronous => None,
+            Durability::Eventual => unreachable!("rejected above"),
         };
 
         // Build coordinator.

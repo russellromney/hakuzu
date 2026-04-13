@@ -26,6 +26,14 @@ pub enum HakuzuError {
 
     /// Engine is closed (semaphore closed, tasks aborted).
     EngineClosed,
+
+    /// Manifest CAS conflict: another writer published a newer version.
+    /// In Dedicated mode this signals split-brain (two active leaders).
+    /// In Shared mode this is normal contention (caller should retry).
+    ManifestCasConflict {
+        db_name: String,
+        expected_version: Option<u64>,
+    },
 }
 
 impl fmt::Display for HakuzuError {
@@ -37,6 +45,13 @@ impl fmt::Display for HakuzuError {
             Self::JournalError(msg) => write!(f, "Journal error: {msg}"),
             Self::CoordinatorError(msg) => write!(f, "Coordinator error: {msg}"),
             Self::EngineClosed => write!(f, "Engine closed"),
+            Self::ManifestCasConflict { db_name, expected_version } => {
+                write!(
+                    f,
+                    "Manifest CAS conflict for '{}' (expected version {:?}, another writer is active)",
+                    db_name, expected_version,
+                )
+            }
         }
     }
 }
@@ -132,6 +147,10 @@ mod tests {
             HakuzuError::JournalError("test".into()),
             HakuzuError::CoordinatorError("test".into()),
             HakuzuError::EngineClosed,
+            HakuzuError::ManifestCasConflict {
+                db_name: "db".into(),
+                expected_version: Some(5),
+            },
         ];
         for err in errors {
             match err {
@@ -141,6 +160,7 @@ mod tests {
                 HakuzuError::JournalError(_) => {}
                 HakuzuError::CoordinatorError(_) => {}
                 HakuzuError::EngineClosed => {}
+                HakuzuError::ManifestCasConflict { .. } => {}
             }
         }
     }

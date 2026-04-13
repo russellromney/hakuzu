@@ -222,14 +222,11 @@ impl TurbographReplicator {
         if !cas_result.success {
             // CAS failure means another writer published a newer manifest.
             // In Dedicated mode this is a fencing violation (two leaders).
-            // In Shared mode this is expected contention (retry).
-            // Err on the side of safety: surface the error.
-            return Err(anyhow!(
-                "TurbographReplicator: manifest CAS failed for '{}' \
-                 (expected version {:?}, another writer is active)",
-                name,
+            // In Shared mode this is expected contention (caller should retry).
+            return Err(crate::error::HakuzuError::ManifestCasConflict {
+                db_name: name.to_string(),
                 expected_version,
-            ));
+            }.into());
         }
 
         tracing::info!(
@@ -442,8 +439,8 @@ mod tests {
         assert!(result.is_err(), "should fail on CAS conflict");
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("CAS failed") && err.contains("another writer"),
-            "error should explain CAS failure: {err}"
+            err.contains("CAS conflict") && err.contains("another writer"),
+            "error should explain CAS conflict: {err}"
         );
     }
 
