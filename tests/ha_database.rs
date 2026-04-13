@@ -47,6 +47,7 @@ fn build_coordinator(
         replicator.clone(),
         Some(lease_store),
         None,
+        None, // node_registry
         follower_behavior,
         "test/",
         config,
@@ -985,3 +986,5 @@ async fn readiness_metrics_in_prometheus() {
 
     db.close().await.unwrap();
 }
+
+// Phase Rubicon tests are in tests/rubicon.rs

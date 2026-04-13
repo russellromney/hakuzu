@@ -92,6 +92,29 @@ pub(crate) async fn run_snapshot_loop(
                 }
 
                 // 1. Drain writes + seal journal for a consistent snapshot.
+                //
+                // ORDERING INVARIANT (critical for correctness):
+                //   a) Hold write_mutex (prevents new writes)
+                //   b) Seal journal via replicator.sync() (flushes pending entries to segment)
+                //   c) Read sequence AFTER seal (captures all sealed entries)
+                //   d) Checkpoint database under snapshot_lock
+                //
+                // The sequence must be read AFTER the seal, not before, because
+                // seal may advance the sequence (flushing buffered entries).
+                //
+                // Phase GraphMeridian turbograph integration will extend this to:
+                //   a) Hold write_mutex
+                //   b) Seal graphstream journal
+                //   c) Read graphstream sequence N
+                //   d) Set turbograph config.journalSeq = N
+                //   e) Call turbograph_sync() (uploads pages to S3, publishes manifest with journalSeq=N)
+                //   f) On follower restore: apply turbograph manifest, then replay graphstream entries > N
+                //
+                // The current code structure supports this: write_mutex is held across
+                // the seal + sequence read, and the sequence is read after seal. For
+                // turbograph integration, steps d-e insert between c and the CHECKPOINT
+                // below. The snapshot_lock write guard in step 2 ensures no concurrent
+                // reads see a partially-checkpointed database.
                 let _write_guard = inner.write_mutex.lock().await;
 
                 {
@@ -102,9 +125,9 @@ pub(crate) async fn run_snapshot_loop(
                     }
                 }
 
-                // Re-read state after seal (seq may have advanced).
+                // Re-read state after seal (seq may have advanced during seal).
                 let snap_seq = state.sequence.load(Ordering::SeqCst);
-                let snap_hash = hex::encode(&*state.chain_hash.lock().unwrap());
+                let snap_hash = hex::encode(&*state.chain_hash.lock().unwrap_or_else(|e| e.into_inner()));
 
                 // 2. Checkpoint + create snapshot under snapshot_lock.
                 let snap_dir = db_path.parent().unwrap_or(&db_path).join("snapshots_tmp");

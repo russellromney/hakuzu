@@ -23,17 +23,34 @@ pub struct RewriteResult {
 ///   gen_random_uuid()   -> $__hakuzu_uuid_N   (UUID v4 string value)
 ///   current_timestamp() -> $__hakuzu_now_N    (ISO 8601 timestamp string)
 ///   current_date()      -> $__hakuzu_date_N   (ISO 8601 date string)
+///   random()            -> $__hakuzu_rand_N   (f64 in [0.0, 1.0))
 ///
 /// Also rewrites `REMOVE n.prop` -> `SET n.prop = NULL` (Kuzu doesn't support REMOVE).
 ///
 /// Does NOT rewrite inside string literals ('...' or "...").
 /// Case-insensitive. Handles optional whitespace between name and `()`.
+///
+/// ## Coverage notes (audited against LadybugDB source 2026-04-12)
+///
+/// All zero-arg non-deterministic built-in functions are covered:
+///   - gen_random_uuid() (NullaryAuxiliary, uuid)
+///   - current_timestamp() (NullaryAuxiliary, date/timestamp)
+///   - current_date() (NullaryAuxiliary, date)
+///   - random() (NullaryAuxiliary, arithmetic)
+///
+/// NOT covered (takes arguments, needs different rewrite strategy):
+///   - nextval(seq_name): non-deterministic but requires arg-aware rewriting.
+///     For now, sequences are not supported in HA mode. If needed, the leader
+///     must evaluate nextval and replace it with the concrete value before journaling.
+///
+/// Deterministic zero-arg functions (no rewrite needed):
+///   - pi(): returns constant 3.14159...
 pub fn rewrite_query(query: &str) -> RewriteResult {
     let bytes = query.as_bytes();
     let len = bytes.len();
     let mut output = Vec::with_capacity(len);
     let mut generated_params = Vec::new();
-    let mut counters = [0u32; 3]; // [uuid, now, date]
+    let mut counters = [0u32; 4]; // [uuid, now, date, rand]
     let mut i = 0;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -75,7 +92,7 @@ pub fn rewrite_query(query: &str) -> RewriteResult {
                     (
                         format!("$__hakuzu_uuid_{n}"),
                         format!("__hakuzu_uuid_{n}"),
-                        Uuid::new_v4().to_string(),
+                        serde_json::Value::String(Uuid::new_v4().to_string()),
                     )
                 }
                 1 => {
@@ -84,21 +101,30 @@ pub fn rewrite_query(query: &str) -> RewriteResult {
                     (
                         format!("$__hakuzu_now_{n}"),
                         format!("__hakuzu_now_{n}"),
-                        generate_timestamp(),
+                        serde_json::Value::String(generate_timestamp()),
                     )
                 }
-                _ => {
+                2 => {
                     let n = counters[2];
                     counters[2] += 1;
                     (
                         format!("$__hakuzu_date_{n}"),
                         format!("__hakuzu_date_{n}"),
-                        generate_date(),
+                        serde_json::Value::String(generate_date()),
+                    )
+                }
+                _ => {
+                    let n = counters[3];
+                    counters[3] += 1;
+                    (
+                        format!("$__hakuzu_rand_{n}"),
+                        format!("__hakuzu_rand_{n}"),
+                        serde_json::json!(generate_random()),
                     )
                 }
             };
             output.extend_from_slice(param_ref.as_bytes());
-            generated_params.push((param_name, serde_json::Value::String(param_value)));
+            generated_params.push((param_name, param_value));
             i += consumed;
         } else {
             output.push(bytes[i]);
@@ -313,6 +339,7 @@ const FUNC_NAMES: &[&[u8]] = &[
     b"gen_random_uuid",   // index 0
     b"current_timestamp", // index 1
     b"current_date",      // index 2
+    b"random",            // index 3 (LadybugDB registers this as "RANDOM")
 ];
 
 /// Try to match a non-deterministic function call at byte position `pos`.
@@ -348,6 +375,23 @@ fn try_match_func(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// Generate a random f64 in [0.0, 1.0), matching LadybugDB's RANDOM() behavior.
+fn generate_random() -> f64 {
+    // LadybugDB's Rand produces u32 / UINT32_MAX. We approximate the same distribution.
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let s = RandomState::new();
+    let mut hasher = s.build_hasher();
+    hasher.write_u64(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos() as u64,
+    );
+    let bits = hasher.finish() as u32;
+    (bits as f64) / (u32::MAX as f64)
 }
 
 /// Generate an ISO 8601 timestamp string from the current system time (UTC).
@@ -468,6 +512,75 @@ mod tests {
         assert_eq!(r.generated_params.len(), 3);
     }
 
+    // --- random() rewrites ---
+
+    #[test]
+    fn test_rewrite_random() {
+        let r = rewrite_query("RETURN random() AS r");
+        assert_eq!(r.query, "RETURN $__hakuzu_rand_0 AS r");
+        assert_eq!(r.generated_params.len(), 1);
+        assert_eq!(r.generated_params[0].0, "__hakuzu_rand_0");
+        let val = r.generated_params[0].1.as_f64().unwrap();
+        assert!(val >= 0.0 && val < 1.0, "random() must be in [0.0, 1.0): got {val}");
+    }
+
+    #[test]
+    fn test_rewrite_random_case_insensitive() {
+        let r = rewrite_query("RETURN RANDOM()");
+        assert_eq!(r.query, "RETURN $__hakuzu_rand_0");
+        assert_eq!(r.generated_params.len(), 1);
+
+        let r2 = rewrite_query("RETURN Random()");
+        assert_eq!(r2.query, "RETURN $__hakuzu_rand_0");
+    }
+
+    #[test]
+    fn test_rewrite_multiple_random() {
+        let r = rewrite_query("RETURN random() AS a, random() AS b");
+        assert_eq!(r.query, "RETURN $__hakuzu_rand_0 AS a, $__hakuzu_rand_1 AS b");
+        assert_eq!(r.generated_params.len(), 2);
+    }
+
+    #[test]
+    fn test_rewrite_random_with_other_functions() {
+        let r = rewrite_query(
+            "CREATE (:T {id: gen_random_uuid(), r: random(), ts: current_timestamp()})",
+        );
+        assert_eq!(
+            r.query,
+            "CREATE (:T {id: $__hakuzu_uuid_0, r: $__hakuzu_rand_0, ts: $__hakuzu_now_0})"
+        );
+        assert_eq!(r.generated_params.len(), 3);
+    }
+
+    #[test]
+    fn test_random_not_in_string() {
+        let r = rewrite_query("RETURN 'random()' AS s");
+        assert_eq!(r.query, "RETURN 'random()' AS s");
+        assert!(r.generated_params.is_empty());
+    }
+
+    #[test]
+    fn test_random_word_boundary() {
+        // xrandom() should NOT be rewritten
+        let r = rewrite_query("RETURN xrandom()");
+        assert_eq!(r.query, "RETURN xrandom()");
+        assert!(r.generated_params.is_empty());
+
+        // _random() should NOT be rewritten
+        let r2 = rewrite_query("RETURN _random()");
+        assert_eq!(r2.query, "RETURN _random()");
+        assert!(r2.generated_params.is_empty());
+    }
+
+    #[test]
+    fn test_random_not_gen_random_uuid() {
+        // gen_random_uuid() should match uuid, not random
+        let r = rewrite_query("RETURN gen_random_uuid()");
+        assert_eq!(r.query, "RETURN $__hakuzu_uuid_0");
+        assert_eq!(r.generated_params[0].0, "__hakuzu_uuid_0");
+    }
+
     // --- String literal protection ---
 
     #[test]
@@ -506,6 +619,9 @@ mod tests {
 
         let r4 = rewrite_query("RETURN CURRENT_DATE()");
         assert_eq!(r4.query, "RETURN $__hakuzu_date_0");
+
+        let r5 = rewrite_query("RETURN RANDOM()");
+        assert_eq!(r5.query, "RETURN $__hakuzu_rand_0");
     }
 
     #[test]

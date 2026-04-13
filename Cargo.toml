@@ -11,15 +11,15 @@ categories = ["database", "network-programming"]
 
 [dependencies]
 # HA coordination framework
-hadb = { path = "../hadb/hadb", version = "0.3" }
-hadb-io = { path = "../hadb/hadb-io", version = "0.3", features = ["s3"] }
-hadb-lease-s3 = { path = "../hadb/hadb-lease-s3", version = "0.3" }
+hadb = { path = "../hadb/hadb", version = "0.4" }
+hadb-io = { path = "../hadb/hadb-io", version = "0.4", features = ["s3"] }
+hadb-lease-s3 = { path = "../hadb/hadb-lease-s3", version = "0.4" }
 
 # Journal replication
 graphstream = { path = "../graphstream", version = "0.3" }
 
 # Kuzu graph database
-lbug = { version = "0.14", default-features = false }
+lbug = { version = "0.15", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -86,7 +86,5 @@ serde_json = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 filetime = "0.2"
-hadb-changeset = "0.3"
+hadb-changeset = { path = "../hadb-changeset", version = "0.3.2", features = ["journal"] }
 
-[patch.crates-io]
-lbug = { path = "../ladybug-fork/tools/rust_api" }

@@ -72,6 +72,9 @@ pub struct HaKuzuBuilder {
     snapshot_interval: Option<Duration>,
     snapshot_every_n_entries: Option<u64>,
     read_concurrency: usize,
+    custom_lease_store: Option<Arc<dyn hadb::LeaseStore>>,
+    external_db: Option<Arc<lbug::Database>>,
+    external_locks: Option<(Arc<tokio::sync::Mutex<()>>, Arc<std::sync::RwLock<()>>)>,
 }
 
 impl HaKuzuBuilder {
@@ -90,6 +93,9 @@ impl HaKuzuBuilder {
             snapshot_interval: None,
             snapshot_every_n_entries: None,
             read_concurrency: DEFAULT_READ_CONCURRENCY,
+            custom_lease_store: None,
+            external_db: None,
+            external_locks: None,
         }
     }
 
@@ -168,8 +174,54 @@ impl HaKuzuBuilder {
         self
     }
 
+    /// Use a custom LeaseStore instead of the default S3LeaseStore.
+    ///
+    /// Works with any `LeaseStore` implementation: NATS, Redis, in-memory, etc.
+    /// When set, the builder skips S3LeaseStore construction in `open()`.
+    pub fn lease_store(mut self, store: Arc<dyn hadb::LeaseStore>) -> Self {
+        self.custom_lease_store = Some(store);
+        self
+    }
+
+    /// Use an externally-created lbug::Database instead of opening one internally.
+    ///
+    /// When set, the builder skips database creation and snapshot bootstrap in
+    /// `open()`. The caller owns the database lifecycle; `HaKuzu::close()` will
+    /// drain the journal and leave the cluster, but will not close the database.
+    ///
+    /// This is how cinch-cloud passes in a graphd-engine Engine's underlying
+    /// database with sandbox config, FTS extensions, and custom memory limits
+    /// already applied.
+    pub fn database(mut self, db: Arc<lbug::Database>) -> Self {
+        self.external_db = Some(db);
+        self
+    }
+
+    /// Provide pre-created write mutex and snapshot lock for the external database.
+    ///
+    /// When using `.database()` with an external engine that already has its own
+    /// concurrency primitives (write mutex, snapshot lock), pass them here so
+    /// hakuzu shares the same locks instead of creating duplicates.
+    pub fn locks(
+        mut self,
+        write_mutex: Arc<tokio::sync::Mutex<()>>,
+        snapshot_lock: Arc<std::sync::RwLock<()>>,
+    ) -> Self {
+        self.external_locks = Some((write_mutex, snapshot_lock));
+        self
+    }
+
     /// Open the database and join the HA cluster.
     pub async fn open(self, db_path: &str, schema: &str) -> Result<HaKuzu> {
+        // Validate: external database requires external locks to prevent data races.
+        // Without shared locks, hakuzu creates independent locks, meaning two lock
+        // systems protect the same database (the caller's and hakuzu's).
+        if self.external_db.is_some() && self.external_locks.is_none() {
+            return Err(anyhow!(
+                "external database requires external locks via .locks() to prevent data races"
+            ));
+        }
+
         let db_path = PathBuf::from(db_path);
         let db_name = db_path
             .file_name()
@@ -185,7 +237,8 @@ impl HaKuzuBuilder {
             detect_address(&instance_id, self.forwarding_port)
         });
 
-        // Build S3 client.
+        // Always build S3 client. Even when lease store and database are both
+        // external, the KuzuReplicator needs S3 for journal segment uploads.
         let s3_config = match &self.endpoint {
             Some(endpoint) => {
                 aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -201,64 +254,73 @@ impl HaKuzuBuilder {
         };
         let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
-        // Snapshot bootstrap: if the database doesn't exist locally, try to
-        // restore from the latest S3 snapshot for faster cold start.
-        let db_exists = db_path.exists()
-            && db_path.read_dir().map_or(false, |mut d| d.next().is_some());
-        if !db_exists {
-            let snap_dest = db_path
-                .parent()
-                .unwrap_or(&db_path)
-                .join("snapshots_tmp");
-            match snapshot::download_latest_snapshot(
-                &s3_client,
-                &self.bucket,
-                &self.prefix,
-                &db_name,
-                &snap_dest,
-            )
-            .await
-            {
-                Ok(Some((snap_path, meta))) => {
-                    snapshot::extract_snapshot(&snap_path, &db_path)?;
+        // Snapshot bootstrap: skip when using an external database (caller
+        // is responsible for the database state).
+        if self.external_db.is_none() {
+            let s3 = &s3_client;
+            let db_exists = db_path.exists()
+                && db_path.read_dir().map_or(false, |mut d| d.next().is_some());
+            if !db_exists {
+                let snap_dest = db_path
+                    .parent()
+                    .unwrap_or(&db_path)
+                    .join("snapshots_tmp");
+                match snapshot::download_latest_snapshot(
+                    s3,
+                    &self.bucket,
+                    &self.prefix,
+                    &db_name,
+                    &snap_dest,
+                )
+                .await
+                {
+                    Ok(Some((snap_path, meta))) => {
+                        snapshot::extract_snapshot(&snap_path, &db_path)?;
 
-                    // Write recovery.json so journal recovery starts from snapshot seq.
-                    let journal_dir = db_path
-                        .parent()
-                        .unwrap_or(&db_path)
-                        .join("journal");
-                    std::fs::create_dir_all(&journal_dir)?;
-                    let hash_bytes = hex::decode(&meta.chain_hash)
-                        .map_err(|e| anyhow!("Invalid chain hash in snapshot: {e}"))?;
-                    let hash_arr: [u8; 32] = hash_bytes.try_into().map_err(|v: Vec<u8>| {
-                        anyhow!("chain_hash in snapshot must be 32 bytes, got {}", v.len())
-                    })?;
-                    graphstream::write_recovery_state(
-                        &journal_dir,
-                        meta.journal_seq,
-                        hash_arr,
-                    )?;
+                        // Write recovery.json so journal recovery starts from snapshot seq.
+                        let journal_dir = db_path
+                            .parent()
+                            .unwrap_or(&db_path)
+                            .join("journal");
+                        std::fs::create_dir_all(&journal_dir)?;
+                        let hash_bytes = hex::decode(&meta.chain_hash)
+                            .map_err(|e| anyhow!("Invalid chain hash in snapshot: {e}"))?;
+                        let hash_arr: [u8; 32] = hash_bytes.try_into().map_err(|v: Vec<u8>| {
+                            anyhow!("chain_hash in snapshot must be 32 bytes, got {}", v.len())
+                        })?;
+                        graphstream::write_recovery_state(
+                            &journal_dir,
+                            meta.journal_seq,
+                            hash_arr,
+                        )?;
 
-                    tracing::info!(
-                        "Bootstrapped from snapshot: seq={}, size={}B",
-                        meta.journal_seq,
-                        meta.db_size_bytes
-                    );
+                        tracing::info!(
+                            "Bootstrapped from snapshot: seq={}, size={}B",
+                            meta.journal_seq,
+                            meta.db_size_bytes
+                        );
 
-                    if let Err(e) = std::fs::remove_dir_all(&snap_dest) {
-                        tracing::error!("Failed to clean snapshot staging dir: {e}");
+                        if let Err(e) = std::fs::remove_dir_all(&snap_dest) {
+                            tracing::error!("Failed to clean snapshot staging dir: {e}");
+                        }
                     }
-                }
-                Ok(None) => {
-                    tracing::debug!("No snapshots available, starting fresh");
-                }
-                Err(e) => {
-                    tracing::error!("Failed to download snapshot, starting fresh: {e}");
+                    Ok(None) => {
+                        tracing::debug!("No snapshots available, starting fresh");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to download snapshot, starting fresh: {e}");
+                    }
                 }
             }
         }
 
-        let lease_store = Arc::new(S3LeaseStore::new(s3_client.clone(), self.bucket.clone()));
+        // Resolve lease store: explicit custom store, or build S3LeaseStore.
+        let lease_store: Arc<dyn hadb::LeaseStore> = match self.custom_lease_store {
+            Some(store) => store,
+            None => {
+                Arc::new(S3LeaseStore::new(s3_client.clone(), self.bucket.clone()))
+            }
+        };
 
         // Build shared ObjectStore for replicator + follower behavior.
         let object_store: Arc<dyn hadb_io::ObjectStore> = Arc::new(
@@ -272,14 +334,22 @@ impl HaKuzuBuilder {
         }
         let replicator = Arc::new(replicator);
 
-        // Open database (potentially from snapshot data).
-        let db = Arc::new(open_database(&db_path, schema)?);
+        // Open database: use external database if provided, otherwise open locally.
+        let db = match self.external_db {
+            Some(ext_db) => ext_db,
+            None => Arc::new(open_database(&db_path, schema)?),
+        };
 
-        // Create locks early so they can be shared with follower behavior.
-        let write_mutex = Arc::new(tokio::sync::Mutex::new(()));
-        let snapshot_lock = Arc::new(std::sync::RwLock::new(()));
+        // Create or use pre-provided locks.
+        let (write_mutex, snapshot_lock) = match self.external_locks {
+            Some(locks) => locks,
+            None => (
+                Arc::new(tokio::sync::Mutex::new(())),
+                Arc::new(std::sync::RwLock::new(())),
+            ),
+        };
 
-        // Build follower behavior — shares locks with HaKuzuInner for replay serialization.
+        // Build follower behavior, shares locks with HaKuzuInner for replay serialization.
         let follower_behavior = Arc::new(
             KuzuFollowerBehavior::new(object_store.clone())
                 .with_shared_db(db.clone())
@@ -306,8 +376,9 @@ impl HaKuzuBuilder {
 
         let coordinator = Coordinator::new(
             replicator.clone(),
-            Some(lease_store as Arc<dyn hadb::LeaseStore>),
+            Some(lease_store),
             None,
+            None, // node_registry
             follower_behavior,
             &self.prefix,
             config,
@@ -380,19 +451,19 @@ impl HaKuzuInner {
     }
 
     fn leader_addr(&self) -> String {
-        self.leader_address.read().unwrap().clone()
+        self.leader_address.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn set_leader_addr(&self, addr: String) {
-        *self.leader_address.write().unwrap() = addr;
+        *self.leader_address.write().unwrap_or_else(|e| e.into_inner()) = addr;
     }
 
     fn set_journal_sender(&self, sender: Option<JournalSender>) {
-        *self.journal_sender.write().unwrap() = sender;
+        *self.journal_sender.write().unwrap_or_else(|e| e.into_inner()) = sender;
     }
 
     fn get_journal_sender(&self) -> Option<JournalSender> {
-        self.journal_sender.read().unwrap().clone()
+        self.journal_sender.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Execute a write locally (leader path). Used by both HaKuzu::execute and forwarding handler.
@@ -406,6 +477,9 @@ impl HaKuzuInner {
         params: Option<&serde_json::Value>,
     ) -> Result<()> {
         let write_start = std::time::Instant::now();
+        // write_mutex serializes all writes. Also held during snapshot seal
+        // (see snapshot_loop.rs) to prevent writes during checkpoint.
+        // Phase GraphMeridian: turbograph_sync() will also run under this lock.
         let _guard = self.write_mutex.lock().await;
 
         // Rewrite non-deterministic functions before execution.
@@ -1071,6 +1145,9 @@ async fn run_role_listener(
                 snapshot_loop::stop_snapshot_loop(&mut snapshot_shutdown, &mut snapshot_handle);
             }
             Ok(RoleEvent::Joined { .. }) => {}
+            Ok(RoleEvent::ManifestChanged { .. }) => {
+                tracing::debug!("HaKuzu: manifest changed (ignored in hakuzu)");
+            }
             Err(_) => {
                 tracing::error!("HaKuzu: role event channel closed");
                 snapshot_loop::stop_snapshot_loop(&mut snapshot_shutdown, &mut snapshot_handle);

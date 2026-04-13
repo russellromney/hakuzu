@@ -1,5 +1,85 @@
 # hakuzu Roadmap
 
+## Phase Rubicon: cinch-cloud Integration (Dedicated+Replicated)
+
+First milestone. Graph databases in cinch-cloud get basic HA with journal replication to S3, leader/follower failover, and write forwarding.
+
+### a. Builder API for external engine
+- [ ] `HaKuzuBuilder::engine(Arc<graphd_engine::Engine>)`: accept an externally-created engine instead of opening a new `lbug::Database`
+- [ ] When set, hakuzu uses this engine for query execution + journal writing
+- [ ] cinch-cloud creates `graphd_engine::Engine` (with sandbox, FTS, connection pool), passes to hakuzu for HA wrapping
+
+### b. Pluggable LeaseStore
+- [ ] `HaKuzuBuilder::lease_store(Arc<dyn LeaseStore>)`: skip S3LeaseStore construction, use any custom store (NATS, Redis, etcd)
+- [ ] Same pattern as haqlite Phase Volt-c
+- [ ] Enables NATS leases from cinch-cloud's shared lease infrastructure
+
+### c. Tests
+- [ ] Two-node HA with external engine: leader writes, follower replays, failover works
+- [ ] Custom lease store (in-memory) used correctly
+- [ ] External engine lifecycle: hakuzu.close() drains journal and seals segment
+
+---
+
+## Phase GraphMeridian: Durability Modes + Shared Mode
+
+Full mode matrix for graph databases. Depends on turbograph Phase GraphZenith (S3Primary mode).
+
+### a. Durability enum
+- [ ] `Durability { Replicated, Synchronous }` (Eventual deferred)
+- [ ] `Replicated` = current behavior (graphstream journal shipping, snapshot bootstrap)
+- [ ] `Synchronous` = turbograph S3Primary on every write (RPO=0)
+
+### b. HaMode enum
+- [ ] `HaMode { Dedicated, Shared }`
+- [ ] `Shared+Synchronous`: lease-per-write. Acquire lease, catch up from turbograph manifest, execute Cypher, sync to S3, release lease
+- [ ] Validate: `Shared+Replicated` returns error
+
+### c. TurbographReplicator
+- [ ] Implement `hadb::Replicator` for turbograph integration
+- [ ] `add()` = no-op (VFS registered at init)
+- [ ] `pull()` = fetch turbograph manifest from ManifestStore, apply via `turbograph_set_manifest` UDF
+- [ ] `sync()` = call `turbograph_sync()` UDF
+- [ ] `remove()` = no-op
+
+### d. Dual follower catch-up paths
+- [ ] Replicated: graphstream journal pull (current behavior)
+- [ ] Synchronous: turbograph manifest fetch + apply via UDF
+
+### e. Tests
+- [ ] Mode matrix: all 3 valid combos (Ded+Rep, Ded+Sync, Shared+Sync)
+- [ ] Write/read/failover for each mode
+- [ ] Shared mode: two nodes alternating writes, both see all data
+
+---
+
+## Phase GraphThermopylae: Chaos Tests
+
+Prove every mode combination works under failure. Port haqlite's Thermopylae test patterns.
+
+- [ ] Kill-all-and-recover (per mode)
+- [ ] Linearizability (Shared mode: last-writer-wins, no lost updates)
+- [ ] RPO measurement (Synchronous=0, Replicated=sync_interval)
+- [ ] SIGKILL during sync (10 iterations, no corruption)
+- [ ] Concurrent readers during failover
+- [ ] Rapid kill/restart cycles
+- [ ] Network partition / split brain
+- [ ] Scale tests (5 min sustained, 10K nodes)
+- [ ] Journal chain integrity after double failover
+
+---
+
+## Phase Summit: CLI Serve + Full Parity
+
+Production-ready standalone hakuzu server.
+
+- [ ] `hakuzu serve` CLI command (port from `haqlite serve`)
+- [ ] Prometheus metrics surface via `prometheus_metrics()`
+- [ ] Mode/durability config via CLI args and env vars
+- [ ] Health/status/metrics HTTP endpoints
+
+---
+
 ## Drop ladybug-fork
 
 > Blocked on: lbug crate publish with StatementType

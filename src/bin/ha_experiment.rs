@@ -377,6 +377,7 @@ async fn main() -> Result<()> {
         replicator.clone() as Arc<dyn hadb::Replicator>,
         Some(lease_store),
         None,
+        None, // node_registry
         follower_behavior,
         &args.prefix,
         coordinator_config,
@@ -407,6 +408,9 @@ async fn main() -> Result<()> {
                     }
                     RoleEvent::Sleeping { db_name } => {
                         info!("*** SLEEPING ({}) ***", db_name);
+                    }
+                    RoleEvent::ManifestChanged { db_name, version } => {
+                        info!("ManifestChanged: {} v{}", db_name, version);
                     }
                 }
             }
