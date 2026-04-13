@@ -78,8 +78,24 @@ impl TurbographFollowerBehavior {
     /// the manifest directly.
     async fn apply_manifest(&self, db_name: &str, manifest: &hadb::HaManifest) -> Result<u64> {
         let version = manifest.version;
-        let json = serde_json::to_string(manifest)
-            .map_err(|e| anyhow!("Failed to serialize manifest: {e}"))?;
+
+        // Extract the raw turbograph-internal JSON (Phase GraphBridge).
+        // This is the format that Manifest::fromJSON() expects on the C++ side.
+        let json = match &manifest.storage {
+            hadb::StorageManifest::Turbograph { manifest_json, .. }
+                if !manifest_json.is_empty() =>
+            {
+                manifest_json.clone()
+            }
+            _ => {
+                return Err(anyhow!(
+                    "manifest_json is empty for '{}' v{} \
+                     (manifest was published before Phase GraphBridge)",
+                    db_name,
+                    version,
+                ));
+            }
+        };
 
         let db = self.db.clone();
         let snapshot_lock = self.snapshot_lock.clone();
@@ -358,6 +374,7 @@ mod tests {
                 subframe_overrides: vec![],
                 encrypted: false,
                 journal_seq: 0,
+                manifest_json: String::new(),
             },
         }
     }
@@ -405,12 +422,33 @@ mod tests {
         assert_eq!(v, 0);
     }
 
-    /// When extension is not loaded, apply_manifest returns an error (UDF missing).
+    /// When manifest_json is empty (pre-GraphBridge), apply returns a clear error.
+    #[tokio::test]
+    async fn apply_manifest_empty_json_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = make_db(tmp.path());
+        let store = Arc::new(FixedManifestStore(turbo_manifest(5)));
+        let behavior = TurbographFollowerBehavior::new(store, db);
+        let result = behavior.apply_latest_manifest("db").await;
+        assert!(result.is_err(), "should reject manifest with empty manifest_json");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("manifest_json is empty"),
+            "error should mention empty manifest_json: {err}"
+        );
+    }
+
+    /// When manifest_json has data but extension is not loaded, apply errors on UDF.
     #[tokio::test]
     async fn apply_manifest_without_extension_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = make_db(tmp.path());
-        let store = Arc::new(FixedManifestStore(turbo_manifest(5)));
+        let mut manifest = turbo_manifest(5);
+        // Set a real-looking manifest_json so we get past the empty check.
+        if let StorageManifest::Turbograph { ref mut manifest_json, .. } = manifest.storage {
+            *manifest_json = r#"{"version":5,"page_count":50,"page_size":4096,"pages_per_group":4096,"page_group_keys":["pg/0_v5"]}"#.to_string();
+        }
+        let store = Arc::new(FixedManifestStore(manifest));
         let behavior = TurbographFollowerBehavior::new(store, db);
         let result = behavior.apply_latest_manifest("db").await;
         assert!(result.is_err(), "should fail without turbograph extension loaded");

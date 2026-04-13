@@ -80,6 +80,21 @@ impl TurbographReplicator {
 
         parse_int64_result(&mut result, "turbograph_set_manifest")
     }
+
+    /// Call turbograph_get_manifest() via lbug connection (Phase GraphBridge).
+    ///
+    /// Returns the current manifest as a JSON string in turbograph's internal
+    /// format. This is the opaque blob that gets stored in manifest_json and
+    /// passed to turbograph_set_manifest() on followers.
+    fn call_get_manifest(&self) -> Result<String> {
+        let conn = lbug::Connection::new(&self.db)
+            .map_err(|e| anyhow!("turbograph_replicator: failed to create connection: {e}"))?;
+        let mut result = conn
+            .query("RETURN turbograph_get_manifest()")
+            .map_err(|e| anyhow!("turbograph_get_manifest() failed: {e}"))?;
+
+        parse_string_result(&mut result, "turbograph_get_manifest")
+    }
 }
 
 #[async_trait]
@@ -91,6 +106,10 @@ impl Replicator for TurbographReplicator {
     }
 
     /// Pull the latest manifest from ManifestStore and apply via turbograph_set_manifest.
+    ///
+    /// Extracts the `manifest_json` field from StorageManifest::Turbograph (the raw
+    /// turbograph-internal JSON) and passes it directly to the UDF. This is the
+    /// correct format that Manifest::fromJSON() expects on the C++ side.
     async fn pull(&self, name: &str, _path: &Path) -> Result<()> {
         let store = self.manifest_store.as_ref().ok_or_else(|| {
             anyhow!("TurbographReplicator: pull requires a ManifestStore (set via with_manifest_store)")
@@ -101,11 +120,24 @@ impl Replicator for TurbographReplicator {
             anyhow!("TurbographReplicator: no manifest found for '{name}'")
         })?;
 
-        let manifest_json = serde_json::to_string(&manifest)
-            .map_err(|e| anyhow!("TurbographReplicator: failed to serialize manifest: {e}"))?;
+        // Extract the raw turbograph manifest JSON from the HaManifest.
+        let json = match &manifest.storage {
+            hadb::StorageManifest::Turbograph { manifest_json, .. }
+                if !manifest_json.is_empty() =>
+            {
+                manifest_json.clone()
+            }
+            _ => {
+                return Err(anyhow!(
+                    "TurbographReplicator: manifest_json is empty for '{}' v{} \
+                     (manifest was published before Phase GraphBridge)",
+                    name,
+                    manifest.version,
+                ));
+            }
+        };
 
         let db = self.db.clone();
-        let json = manifest_json.clone();
         let version = tokio::task::spawn_blocking(move || {
             let replicator = TurbographReplicator { db, manifest_store: None };
             replicator.call_set_manifest(&json)
@@ -134,37 +166,39 @@ impl Replicator for TurbographReplicator {
     }
 
     /// Checkpoint + upload to S3 via turbograph_sync(). RPO = 0.
+    ///
+    /// After sync, reads the full manifest JSON via turbograph_get_manifest()
+    /// and publishes it to the ManifestStore so followers can apply it.
     async fn sync(&self, name: &str) -> Result<()> {
         let db = self.db.clone();
-        let version = tokio::task::spawn_blocking(move || {
+        let (version, manifest_json) = tokio::task::spawn_blocking(move || {
             let replicator = TurbographReplicator { db, manifest_store: None };
-            replicator.call_sync()
+            let version = replicator.call_sync()?;
+            // Phase GraphBridge: read the full manifest JSON after sync.
+            // If the UDF isn't available (extension too old), fall back to empty.
+            let json = replicator.call_get_manifest().unwrap_or_default();
+            Ok::<_, anyhow::Error>((version, json))
         })
         .await
         .map_err(|e| anyhow!("TurbographReplicator sync task panicked: {e}"))??;
 
         tracing::info!(
-            "TurbographReplicator: sync for '{}' completed, manifest version = {}",
+            "TurbographReplicator: sync for '{}' completed, manifest version = {}, json_len = {}",
             name,
             version,
+            manifest_json.len(),
         );
 
-        // If we have a manifest store, publish the new version so followers can discover it.
-        //
-        // TODO(GraphMeridian): This publishes a STUB manifest (page_count: 0, empty
-        // page_group_keys, etc.). The follower's TurbographFollowerBehavior serializes
-        // this to JSON and passes it to turbograph_set_manifest(). For end-to-end
-        // Synchronous mode, either:
-        //   (a) turbograph_sync() should return the full manifest JSON, which gets
-        //       stored in the HaManifest.storage field, OR
-        //   (b) add a turbograph_get_manifest() UDF to read the real manifest after sync
-        // Until this is resolved, Synchronous follower catch-up is structurally incomplete.
+        // Publish the manifest to the ManifestStore so followers can discover it.
         if let Some(ref store) = self.manifest_store {
             let current = store.get(name).await?;
             let expected_version = current.as_ref().map(|m| m.version);
 
-            // STUB manifest: version-only coordination record.
-            // See TODO above for the full manifest design.
+            // Parse simple scalars from the turbograph JSON for monitoring.
+            // The manifest_json blob is the source of truth for followers.
+            let parsed: serde_json::Value = serde_json::from_str(&manifest_json)
+                .unwrap_or_default();
+
             let manifest = hadb::HaManifest {
                 version: version as u64,
                 writer_id: String::new(),
@@ -172,15 +206,19 @@ impl Replicator for TurbographReplicator {
                 timestamp_ms: 0,
                 storage: hadb::StorageManifest::Turbograph {
                     turbograph_version: version as u64,
-                    page_count: 0,
-                    page_size: 0,
-                    pages_per_group: 0,
-                    sub_pages_per_frame: 0,
-                    page_group_keys: vec![],
-                    frame_tables: vec![],
-                    subframe_overrides: vec![],
-                    encrypted: false,
-                    journal_seq: 0,
+                    page_count: parsed["page_count"].as_u64().unwrap_or(0),
+                    page_size: parsed["page_size"].as_u64().unwrap_or(0) as u32,
+                    pages_per_group: parsed["pages_per_group"].as_u64().unwrap_or(0) as u32,
+                    sub_pages_per_frame: parsed["sub_pages_per_frame"].as_u64().unwrap_or(0) as u32,
+                    page_group_keys: parsed["page_group_keys"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default(),
+                    frame_tables: vec![],        // populated in manifest_json blob
+                    subframe_overrides: vec![],  // populated in manifest_json blob
+                    encrypted: parsed["encrypted"].as_bool().unwrap_or(false),
+                    journal_seq: parsed["journal_seq"].as_u64().unwrap_or(0),
+                    manifest_json,
                 },
             };
 
@@ -212,6 +250,25 @@ fn parse_int64_result(result: &mut lbug::QueryResult, fn_name: &str) -> Result<i
         lbug::Value::Int64(v) => Ok(*v),
         other => Err(anyhow!(
             "{fn_name}() returned unexpected type: {:?} (expected INT64)",
+            other
+        )),
+    }
+}
+
+/// Parse a single STRING result from a lbug query result.
+fn parse_string_result(result: &mut lbug::QueryResult, fn_name: &str) -> Result<String> {
+    let row = result.next().ok_or_else(|| {
+        anyhow!("{fn_name}() returned no rows")
+    })?;
+
+    if row.is_empty() {
+        return Err(anyhow!("{fn_name}() returned empty row"));
+    }
+
+    match &row[0] {
+        lbug::Value::String(v) => Ok(v.clone()),
+        other => Err(anyhow!(
+            "{fn_name}() returned unexpected type: {:?} (expected STRING)",
             other
         )),
     }

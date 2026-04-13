@@ -87,13 +87,6 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
         ),
     };
 
-    // TODO(GraphMeridian): Synchronous mode requires a ManifestStore for follower
-    // catch-up. Currently no manifest store is wired here. Need to add either:
-    //   - S3ManifestStore from hadb-manifest-s3 (add dependency + feature flag)
-    //   - NatsManifestStore from hadb-manifest-nats (same pattern as haqlite)
-    // Without this, `hakuzu serve` with durability=synchronous crashes on open()
-    // with a clear error ("requires ManifestStore"). This is a known gap.
-
     // Build HaKuzu.
     let mut builder = HaKuzu::builder(&shared.s3.bucket)
         .mode(ha_mode)
@@ -109,6 +102,29 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
     }
     if let Some(ref secret) = serve.secret {
         builder = builder.secret(secret);
+    }
+
+    // Wire ManifestStore for Synchronous durability (S3-backed).
+    if matches!(durability, Durability::Synchronous) {
+        let s3_config = match &shared.s3.endpoint {
+            Some(endpoint) => {
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .endpoint_url(endpoint)
+                    .load()
+                    .await
+            }
+            None => {
+                aws_config::defaults(aws_config::BehaviorVersion::latest())
+                    .load()
+                    .await
+            }
+        };
+        let s3_client = aws_sdk_s3::Client::new(&s3_config);
+        let manifest_store = Arc::new(
+            hadb_manifest_s3::S3ManifestStore::new(s3_client, shared.s3.bucket.clone()),
+        );
+        builder = builder.manifest_store(manifest_store);
+        info!("using S3 manifest store for Synchronous durability");
     }
 
     // Snapshot config (Replicated mode only, Synchronous uses turbograph_sync).
