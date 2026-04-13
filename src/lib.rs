@@ -41,7 +41,7 @@ pub use builder::HaKuzuBuilder;
 pub use database::{HaKuzu, QueryResult, SnapshotConfig};
 pub use error::HakuzuError;
 pub use metrics::HakuzuMetrics;
-pub use mode::{Durability, HaMode};
+pub use hadb::{Durability, HaMode, validate_mode_durability};
 pub use snapshot::SnapshotMeta;
 pub use replicator::KuzuReplicator;
 pub use turbograph_follower_behavior::TurbographFollowerBehavior;

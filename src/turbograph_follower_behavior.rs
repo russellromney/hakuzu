@@ -183,52 +183,80 @@ impl FollowerBehavior for TurbographFollowerBehavior {
 
             let current_version = position.load(Ordering::SeqCst);
 
-            match self.manifest_store.get(db_name).await {
-                Ok(Some(m)) if m.version > current_version => {
-                    caught_up.store(false, Ordering::SeqCst);
-                    metrics.follower_caught_up.store(0, Ordering::Relaxed);
-
-                    // Hold write_mutex during apply to prevent concurrent reads
-                    // from seeing partially-applied manifest state.
-                    let _write_guard = match &self.write_mutex {
-                        Some(wm) => Some(wm.lock().await),
-                        None => None,
-                    };
-
-                    // Use the pre-fetched manifest directly (no double-fetch).
-                    match self.apply_manifest(db_name, &m).await {
-                        Ok(v) => {
-                            position.store(v, Ordering::SeqCst);
-                            metrics.follower_replay_position.store(v, Ordering::Relaxed);
-                            metrics.inc(&metrics.follower_pulls_succeeded);
-                            caught_up.store(true, Ordering::SeqCst);
-                            metrics.follower_caught_up.store(1, Ordering::Relaxed);
-                            tracing::debug!(
-                                "TurbographFollower '{}': manifest v{} -> v{}",
-                                db_name,
-                                current_version,
-                                v,
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "TurbographFollower '{}': apply_manifest failed: {}",
-                                db_name,
-                                e,
-                            );
-                            metrics.inc(&metrics.follower_pulls_failed);
-                        }
-                    }
-                }
+            // Cheap version check via meta() (HeadObject on S3, no body download).
+            // Only fetch the full manifest via get() when the version actually changed.
+            let meta = self.manifest_store.meta(db_name).await;
+            let new_version = match &meta {
+                Ok(Some(m)) if m.version > current_version => m.version,
                 Ok(_) => {
-                    // Already on latest version.
+                    // Already on latest version (or no manifest yet).
                     caught_up.store(true, Ordering::SeqCst);
                     metrics.follower_caught_up.store(1, Ordering::Relaxed);
                     metrics.inc(&metrics.follower_pulls_no_new_data);
+                    continue;
                 }
                 Err(e) => {
                     tracing::error!(
-                        "TurbographFollower '{}': manifest store error: {}",
+                        "TurbographFollower '{}': manifest store meta error: {}",
+                        db_name,
+                        e,
+                    );
+                    metrics.inc(&metrics.follower_pulls_failed);
+                    continue;
+                }
+            };
+
+            // New version detected. Fetch the full manifest for apply.
+            caught_up.store(false, Ordering::SeqCst);
+            metrics.follower_caught_up.store(0, Ordering::Relaxed);
+
+            let manifest = match self.manifest_store.get(db_name).await {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    // Race: meta() saw a version but get() returned None.
+                    // Shouldn't happen in practice; retry on next poll.
+                    tracing::warn!(
+                        "TurbographFollower '{}': meta returned v{} but get() returned None",
+                        db_name,
+                        new_version,
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "TurbographFollower '{}': manifest store get error: {}",
+                        db_name,
+                        e,
+                    );
+                    metrics.inc(&metrics.follower_pulls_failed);
+                    continue;
+                }
+            };
+
+            // Hold write_mutex during apply to prevent concurrent reads
+            // from seeing partially-applied manifest state.
+            let _write_guard = match &self.write_mutex {
+                Some(wm) => Some(wm.lock().await),
+                None => None,
+            };
+
+            match self.apply_manifest(db_name, &manifest).await {
+                Ok(v) => {
+                    position.store(v, Ordering::SeqCst);
+                    metrics.follower_replay_position.store(v, Ordering::Relaxed);
+                    metrics.inc(&metrics.follower_pulls_succeeded);
+                    caught_up.store(true, Ordering::SeqCst);
+                    metrics.follower_caught_up.store(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        "TurbographFollower '{}': manifest v{} -> v{}",
+                        db_name,
+                        current_version,
+                        v,
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "TurbographFollower '{}': apply_manifest failed: {}",
                         db_name,
                         e,
                     );

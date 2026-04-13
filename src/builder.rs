@@ -206,9 +206,14 @@ impl HaKuzuBuilder {
 
     /// Open the database and join the HA cluster.
     pub async fn open(self, db_path: &str, schema: &str) -> Result<HaKuzu> {
-        // Validate mode + durability combination.
+        // Validate mode + durability combination (hadb-level rules).
         mode::validate_mode_durability(self.ha_mode, self.durability)
             .map_err(|e| anyhow!("{e}"))?;
+
+        // Hakuzu-specific: Shared mode not yet implemented.
+        if matches!(self.ha_mode, HaMode::Shared) {
+            return Err(anyhow!("Shared mode not yet implemented in hakuzu"));
+        }
 
         // External database requires external locks to prevent data races.
         // Without shared locks, hakuzu creates independent locks, meaning two lock

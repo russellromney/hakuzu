@@ -203,11 +203,16 @@ impl Replicator for TurbographReplicator {
 
             let cas_result = store.put(name, &manifest, expected_version).await?;
             if !cas_result.success {
-                tracing::warn!(
-                    "TurbographReplicator: manifest CAS failed for '{}' (expected version {:?})",
+                // CAS failure means another writer published a newer manifest.
+                // In Dedicated mode this is a fencing violation (two leaders).
+                // In Shared mode this is expected contention (retry).
+                // Err on the side of safety: surface the error.
+                return Err(anyhow!(
+                    "TurbographReplicator: manifest CAS failed for '{}' \
+                     (expected version {:?}, another writer is active)",
                     name,
                     expected_version,
-                );
+                ));
             }
         }
 

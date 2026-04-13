@@ -31,12 +31,10 @@ fn shared_replicated_rejected() {
 }
 
 #[test]
-fn shared_synchronous_not_yet_implemented() {
-    let err = validate_mode_durability(HaMode::Shared, Durability::Synchronous).unwrap_err();
-    assert!(
-        err.contains("not yet implemented"),
-        "should explain Shared is not yet implemented: {err}"
-    );
+fn shared_synchronous_valid_at_hadb_level() {
+    // Shared+Synchronous is a valid combination at the hadb level.
+    // hakuzu's builder rejects it as "not yet implemented" (implementation-specific).
+    assert!(validate_mode_durability(HaMode::Shared, Durability::Synchronous).is_ok());
 }
 
 #[test]

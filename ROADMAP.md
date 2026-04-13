@@ -75,6 +75,24 @@ Production-ready standalone hakuzu server.
 
 ---
 
+## Phase GraphParity: Semantic alignment with haqlite
+
+> After: Phase Summit, Phase GraphBridge
+
+Cross-stack consistency fixes found during semantic review of hakuzu vs haqlite.
+
+### hadb changes (upstream)
+- [ ] Move `validate_mode_durability()` to hadb (currently hakuzu-only, should be shared)
+
+### hakuzu changes
+- [x] Use `meta()` before `get()` in TurbographFollowerBehavior (cheap poll, full fetch on version change only)
+- [x] CAS conflict in sync() should error, not warn (fencing violation in Dedicated mode)
+
+### haqlite changes
+- [ ] Add ManifestChanged fast-path wakeup for turbolite Synchronous mode (hakuzu has this, haqlite doesn't)
+
+---
+
 ## Drop ladybug-fork
 
 > Blocked on: lbug crate publish with StatementType
