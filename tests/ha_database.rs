@@ -790,11 +790,30 @@ async fn forwarding_retry_exhausts_backoff() {
     }
     let db2 = Arc::new(db2);
 
-    let (coord2, repl2) = build_coordinator(
-        lease_store.clone(),
-        "retry-follower",
-        "http://localhost:19061",
-        db2.clone(),
+    // Build follower coordinator with slow promotion: requires 1000 consecutive
+    // expired reads before claiming. Prevents premature promotion when the leader
+    // closes during the test (which happens fast with InMemoryLeaseStore).
+    let object_store2 = common::MockObjectStore::new();
+    let repl2 = Arc::new(KuzuReplicator::new(object_store2.clone(), "test/".into()));
+    let fb2 = Arc::new(KuzuFollowerBehavior::new(object_store2).with_shared_db(db2.clone()));
+    let slow_config = CoordinatorConfig {
+        lease: Some(LeaseConfig {
+            instance_id: "retry-follower".into(),
+            address: "http://localhost:19061".into(),
+            follower_poll_interval: Duration::from_secs(60),
+            required_expired_reads: 1000,
+            ..LeaseConfig::new("retry-follower".into(), "http://localhost:19061".into())
+        }),
+        ..Default::default()
+    };
+    let coord2 = Coordinator::new(
+        repl2.clone(),
+        Some(lease_store.clone()),
+        None,
+        None,
+        fb2,
+        "test/",
+        slow_config,
     );
 
     let follower = HaKuzu::from_coordinator(

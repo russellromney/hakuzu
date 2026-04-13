@@ -25,31 +25,11 @@ First milestone. Graph databases in cinch-cloud get basic HA with journal replic
 
 Full mode matrix for graph databases. Depends on turbograph Phase GraphZenith (S3Primary mode).
 
-### a. Durability enum
-- [ ] `Durability { Replicated, Synchronous }` (Eventual deferred)
-- [ ] `Replicated` = current behavior (graphstream journal shipping, snapshot bootstrap)
-- [ ] `Synchronous` = turbograph S3Primary on every write (RPO=0)
+**Status:** a/b/d done. c deferred until GraphZenith.
 
-### b. HaMode enum
-- [ ] `HaMode { Dedicated, Shared }`
-- [ ] `Shared+Synchronous`: lease-per-write. Acquire lease, catch up from turbograph manifest, execute Cypher, sync to S3, release lease
-- [ ] Validate: `Shared+Replicated` returns error
-
-### c. TurbographReplicator
-- [ ] Implement `hadb::Replicator` for turbograph integration
-- [ ] `add()` = no-op (VFS registered at init)
-- [ ] `pull()` = fetch turbograph manifest from ManifestStore, apply via `turbograph_set_manifest` UDF
-- [ ] `sync()` = call `turbograph_sync()` UDF
-- [ ] `remove()` = no-op
-
-### d. Dual follower catch-up paths
-- [ ] Replicated: graphstream journal pull (current behavior)
-- [ ] Synchronous: turbograph manifest fetch + apply via UDF
-
-### e. Tests
-- [ ] Mode matrix: all 3 valid combos (Ded+Rep, Ded+Sync, Shared+Sync)
-- [ ] Write/read/failover for each mode
-- [ ] Shared mode: two nodes alternating writes, both see all data
+### Remaining: Shared mode (c)
+- [ ] `Shared+Synchronous`: lease-per-write `execute_shared()`. Acquire lease, catch up from turbograph manifest, execute, sync to S3, release
+- [ ] Tests: two nodes alternating writes, both see all data
 
 ---
 
@@ -57,15 +37,25 @@ Full mode matrix for graph databases. Depends on turbograph Phase GraphZenith (S
 
 Prove every mode combination works under failure. Port haqlite's Thermopylae test patterns.
 
-- [ ] Kill-all-and-recover (per mode)
-- [ ] Linearizability (Shared mode: last-writer-wins, no lost updates)
+**Status:** Dedicated+Replicated done (9 tests). Synchronous/Shared mode deferred until extensions available.
+
+### Done (Ded+Rep, in-memory backends)
+- Kill-leader/follower-promotes with data verification
+- Rapid restart cycles (5 cycles, 50 nodes)
+- Close/reopen different leader, data visible
+- Concurrent readers + writers (100 writes, 200 reads)
+- Handoff under active writes
+- Close with concurrent reads (10 reader tasks)
+- Metrics consistency through lifecycle
+- Stress: 200 writes + 5 concurrent readers
+- Schema DDL survives restart
+
+### Remaining (needs turbograph extension or Shared mode)
 - [ ] RPO measurement (Synchronous=0, Replicated=sync_interval)
-- [ ] SIGKILL during sync (10 iterations, no corruption)
-- [ ] Concurrent readers during failover
-- [ ] Rapid kill/restart cycles
-- [ ] Network partition / split brain
-- [ ] Scale tests (5 min sustained, 10K nodes)
-- [ ] Journal chain integrity after double failover
+- [ ] SIGKILL during sync (separate binary, process-level control)
+- [ ] Linearizability (Shared mode: last-writer-wins, no lost updates)
+- [ ] Network partition / split brain simulation
+- [ ] Scale: 5 min sustained writes, 10K nodes
 
 ---
 
@@ -73,10 +63,15 @@ Prove every mode combination works under failure. Port haqlite's Thermopylae tes
 
 Production-ready standalone hakuzu server.
 
-- [ ] `hakuzu serve` CLI command (port from `haqlite serve`)
-- [ ] Prometheus metrics surface via `prometheus_metrics()`
-- [ ] Mode/durability config via CLI args and env vars
-- [ ] Health/status/metrics HTTP endpoints
+**Status:** Done.
+
+- `hakuzu serve` via hadb-cli framework (serve, explain, restore, list, verify, compact, replicate, snapshot)
+- Prometheus metrics via GET /metrics (exposition format)
+- Mode/durability config via TOML ([serve] mode/durability) + env vars (HAKUZU_MODE, HAKUZU_DURABILITY)
+- Health/status/metrics HTTP endpoints (GET /health, /status, /metrics)
+- Cypher HTTP API (POST /cypher with JSON body)
+- Bearer token auth on all endpoints except /health
+- SIGTERM graceful shutdown (drain writes, close HaKuzu)
 
 ---
 

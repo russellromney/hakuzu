@@ -16,25 +16,35 @@
 //! let result = db.query("MATCH (p:Person) RETURN p.id, p.name", None).await?;
 //! ```
 
+pub mod builder;
+pub mod cli_config;
 pub mod database;
 pub mod error;
 pub mod follower_behavior;
 pub mod forwarding;
 pub mod metrics;
+pub mod mode;
 pub mod mutation;
 pub mod replay;
 pub mod replicator;
 pub mod rewriter;
+pub mod serve;
 pub mod snapshot;
 mod snapshot_loop;
+pub mod turbograph_follower_behavior;
+pub mod turbograph_replicator;
 pub mod values;
 
 // Primary API.
-pub use database::{HaKuzu, HaKuzuBuilder, QueryResult, SnapshotConfig};
+pub use builder::HaKuzuBuilder;
+pub use database::{HaKuzu, QueryResult, SnapshotConfig};
 pub use error::HakuzuError;
 pub use metrics::HakuzuMetrics;
+pub use mode::{Durability, HaMode};
 pub use snapshot::SnapshotMeta;
 pub use replicator::KuzuReplicator;
+pub use turbograph_follower_behavior::TurbographFollowerBehavior;
+pub use turbograph_replicator::TurbographReplicator;
 pub use follower_behavior::KuzuFollowerBehavior;
 
 // Re-export hadb types.

@@ -17,24 +17,21 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use axum::routing::post;
 use graphstream::journal::{JournalCommand, JournalSender, PendingEntry};
-use hadb::{Coordinator, CoordinatorConfig, JoinResult, LeaseConfig, Role, RoleEvent};
-use hadb_lease_s3::S3LeaseStore;
+use hadb::{Coordinator, JoinResult, Role, RoleEvent};
 
+use crate::builder::HaKuzuBuilder;
 use crate::error::HakuzuError;
-use crate::follower_behavior::KuzuFollowerBehavior;
 use crate::forwarding::{self, ForwardingState};
 use crate::metrics;
+use crate::mode::Durability;
 use crate::mutation::is_mutation;
 use crate::replicator::KuzuReplicator;
 use crate::rewriter;
-use crate::snapshot;
+use crate::snapshot_loop::{self, SnapshotContext};
 use crate::values;
 
-const DEFAULT_PREFIX: &str = "hakuzu/";
-const DEFAULT_FORWARDING_PORT: u16 = 18080;
-const DEFAULT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_SNAPSHOT_EVERY_N_ENTRIES: u64 = 10_000;
-const DEFAULT_READ_CONCURRENCY: usize = 8;
+pub(crate) const ROLE_LEADER: u8 = 0;
+pub(crate) const ROLE_FOLLOWER: u8 = 1;
 
 /// Configuration for periodic snapshot creation (leader only).
 #[derive(Debug, Clone)]
@@ -45,11 +42,6 @@ pub struct SnapshotConfig {
     pub every_n_entries: u64,
 }
 
-use crate::snapshot_loop::{self, SnapshotContext};
-
-const ROLE_LEADER: u8 = 0;
-const ROLE_FOLLOWER: u8 = 1;
-
 /// Query result returned from `HaKuzu::query()`.
 #[derive(Debug, Clone)]
 pub struct QueryResult {
@@ -57,354 +49,9 @@ pub struct QueryResult {
     pub rows: Vec<Vec<serde_json::Value>>,
 }
 
-/// Builder for creating an HA Kuzu instance.
-pub struct HaKuzuBuilder {
-    bucket: String,
-    prefix: String,
-    endpoint: Option<String>,
-    instance_id: Option<String>,
-    address: Option<String>,
-    forwarding_port: u16,
-    forward_timeout: Duration,
-    coordinator_config: Option<CoordinatorConfig>,
-    secret: Option<String>,
-    upload_interval: Option<Duration>,
-    snapshot_interval: Option<Duration>,
-    snapshot_every_n_entries: Option<u64>,
-    read_concurrency: usize,
-    custom_lease_store: Option<Arc<dyn hadb::LeaseStore>>,
-    external_db: Option<Arc<lbug::Database>>,
-    external_locks: Option<(Arc<tokio::sync::Mutex<()>>, Arc<std::sync::RwLock<()>>)>,
-}
-
-impl HaKuzuBuilder {
-    fn new(bucket: &str) -> Self {
-        Self {
-            bucket: bucket.to_string(),
-            prefix: DEFAULT_PREFIX.to_string(),
-            endpoint: None,
-            instance_id: None,
-            address: None,
-            forwarding_port: DEFAULT_FORWARDING_PORT,
-            forward_timeout: DEFAULT_FORWARD_TIMEOUT,
-            coordinator_config: None,
-            secret: None,
-            upload_interval: None,
-            snapshot_interval: None,
-            snapshot_every_n_entries: None,
-            read_concurrency: DEFAULT_READ_CONCURRENCY,
-            custom_lease_store: None,
-            external_db: None,
-            external_locks: None,
-        }
-    }
-
-    /// S3 key prefix for all hakuzu data. Default: "hakuzu/".
-    pub fn prefix(mut self, prefix: &str) -> Self {
-        self.prefix = prefix.to_string();
-        self
-    }
-
-    /// S3 endpoint URL (for Tigris, MinIO, R2, etc).
-    pub fn endpoint(mut self, endpoint: &str) -> Self {
-        self.endpoint = Some(endpoint.to_string());
-        self
-    }
-
-    /// Unique instance ID for this node. Default: FLY_MACHINE_ID env or UUID.
-    pub fn instance_id(mut self, id: &str) -> Self {
-        self.instance_id = Some(id.to_string());
-        self
-    }
-
-    /// Network address for this node (how other nodes reach the forwarding server).
-    pub fn address(mut self, addr: &str) -> Self {
-        self.address = Some(addr.to_string());
-        self
-    }
-
-    /// Port for the internal write-forwarding HTTP server. Default: 18080.
-    pub fn forwarding_port(mut self, port: u16) -> Self {
-        self.forwarding_port = port;
-        self
-    }
-
-    /// Timeout for forwarded write requests. Default: 5s.
-    pub fn forward_timeout(mut self, timeout: Duration) -> Self {
-        self.forward_timeout = timeout;
-        self
-    }
-
-    /// Override the coordinator config (lease timing, sync interval, etc).
-    pub fn coordinator_config(mut self, config: CoordinatorConfig) -> Self {
-        self.coordinator_config = Some(config);
-        self
-    }
-
-    /// Shared secret for authenticating forwarding requests.
-    pub fn secret(mut self, secret: &str) -> Self {
-        self.secret = Some(secret.to_string());
-        self
-    }
-
-    /// Upload interval for journal segments to S3. Default: 10s.
-    pub fn upload_interval(mut self, interval: Duration) -> Self {
-        self.upload_interval = Some(interval);
-        self
-    }
-
-    /// How often the leader checks if a snapshot should be taken.
-    /// Setting this enables periodic snapshots. Default threshold: 10,000 entries.
-    pub fn snapshot_interval(mut self, interval: Duration) -> Self {
-        self.snapshot_interval = Some(interval);
-        self
-    }
-
-    /// Minimum journal entries since last snapshot before taking a new one.
-    /// Requires `snapshot_interval` to be set. Default: 10,000.
-    pub fn snapshot_every_n_entries(mut self, n: u64) -> Self {
-        self.snapshot_every_n_entries = Some(n);
-        self
-    }
-
-    /// Maximum number of concurrent read operations. Default: 8.
-    /// Benchmarking shows 8 permits is optimal for most workloads.
-    pub fn read_concurrency(mut self, n: usize) -> Self {
-        self.read_concurrency = n;
-        self
-    }
-
-    /// Use a custom LeaseStore instead of the default S3LeaseStore.
-    ///
-    /// Works with any `LeaseStore` implementation: NATS, Redis, in-memory, etc.
-    /// When set, the builder skips S3LeaseStore construction in `open()`.
-    pub fn lease_store(mut self, store: Arc<dyn hadb::LeaseStore>) -> Self {
-        self.custom_lease_store = Some(store);
-        self
-    }
-
-    /// Use an externally-created lbug::Database instead of opening one internally.
-    ///
-    /// When set, the builder skips database creation and snapshot bootstrap in
-    /// `open()`. The caller owns the database lifecycle; `HaKuzu::close()` will
-    /// drain the journal and leave the cluster, but will not close the database.
-    ///
-    /// This is how cinch-cloud passes in a graphd-engine Engine's underlying
-    /// database with sandbox config, FTS extensions, and custom memory limits
-    /// already applied.
-    pub fn database(mut self, db: Arc<lbug::Database>) -> Self {
-        self.external_db = Some(db);
-        self
-    }
-
-    /// Provide pre-created write mutex and snapshot lock for the external database.
-    ///
-    /// When using `.database()` with an external engine that already has its own
-    /// concurrency primitives (write mutex, snapshot lock), pass them here so
-    /// hakuzu shares the same locks instead of creating duplicates.
-    pub fn locks(
-        mut self,
-        write_mutex: Arc<tokio::sync::Mutex<()>>,
-        snapshot_lock: Arc<std::sync::RwLock<()>>,
-    ) -> Self {
-        self.external_locks = Some((write_mutex, snapshot_lock));
-        self
-    }
-
-    /// Open the database and join the HA cluster.
-    pub async fn open(self, db_path: &str, schema: &str) -> Result<HaKuzu> {
-        // Validate: external database requires external locks to prevent data races.
-        // Without shared locks, hakuzu creates independent locks, meaning two lock
-        // systems protect the same database (the caller's and hakuzu's).
-        if self.external_db.is_some() && self.external_locks.is_none() {
-            return Err(anyhow!(
-                "external database requires external locks via .locks() to prevent data races"
-            ));
-        }
-
-        let db_path = PathBuf::from(db_path);
-        let db_name = db_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("db")
-            .to_string();
-
-        let instance_id = self.instance_id.unwrap_or_else(|| {
-            std::env::var("FLY_MACHINE_ID")
-                .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
-        });
-        let address = self.address.unwrap_or_else(|| {
-            detect_address(&instance_id, self.forwarding_port)
-        });
-
-        // Always build S3 client. Even when lease store and database are both
-        // external, the KuzuReplicator needs S3 for journal segment uploads.
-        let s3_config = match &self.endpoint {
-            Some(endpoint) => {
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .endpoint_url(endpoint)
-                    .load()
-                    .await
-            }
-            None => {
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .load()
-                    .await
-            }
-        };
-        let s3_client = aws_sdk_s3::Client::new(&s3_config);
-
-        // Snapshot bootstrap: skip when using an external database (caller
-        // is responsible for the database state).
-        if self.external_db.is_none() {
-            let s3 = &s3_client;
-            let db_exists = db_path.exists()
-                && db_path.read_dir().map_or(false, |mut d| d.next().is_some());
-            if !db_exists {
-                let snap_dest = db_path
-                    .parent()
-                    .unwrap_or(&db_path)
-                    .join("snapshots_tmp");
-                match snapshot::download_latest_snapshot(
-                    s3,
-                    &self.bucket,
-                    &self.prefix,
-                    &db_name,
-                    &snap_dest,
-                )
-                .await
-                {
-                    Ok(Some((snap_path, meta))) => {
-                        snapshot::extract_snapshot(&snap_path, &db_path)?;
-
-                        // Write recovery.json so journal recovery starts from snapshot seq.
-                        let journal_dir = db_path
-                            .parent()
-                            .unwrap_or(&db_path)
-                            .join("journal");
-                        std::fs::create_dir_all(&journal_dir)?;
-                        let hash_bytes = hex::decode(&meta.chain_hash)
-                            .map_err(|e| anyhow!("Invalid chain hash in snapshot: {e}"))?;
-                        let hash_arr: [u8; 32] = hash_bytes.try_into().map_err(|v: Vec<u8>| {
-                            anyhow!("chain_hash in snapshot must be 32 bytes, got {}", v.len())
-                        })?;
-                        graphstream::write_recovery_state(
-                            &journal_dir,
-                            meta.journal_seq,
-                            hash_arr,
-                        )?;
-
-                        tracing::info!(
-                            "Bootstrapped from snapshot: seq={}, size={}B",
-                            meta.journal_seq,
-                            meta.db_size_bytes
-                        );
-
-                        if let Err(e) = std::fs::remove_dir_all(&snap_dest) {
-                            tracing::error!("Failed to clean snapshot staging dir: {e}");
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::debug!("No snapshots available, starting fresh");
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to download snapshot, starting fresh: {e}");
-                    }
-                }
-            }
-        }
-
-        // Resolve lease store: explicit custom store, or build S3LeaseStore.
-        let lease_store: Arc<dyn hadb::LeaseStore> = match self.custom_lease_store {
-            Some(store) => store,
-            None => {
-                Arc::new(S3LeaseStore::new(s3_client.clone(), self.bucket.clone()))
-            }
-        };
-
-        // Build shared ObjectStore for replicator + follower behavior.
-        let object_store: Arc<dyn hadb_io::ObjectStore> = Arc::new(
-            hadb_io::S3Backend::new(s3_client.clone(), self.bucket.clone()),
-        );
-
-        // Build replicator.
-        let mut replicator = KuzuReplicator::new(object_store.clone(), self.prefix.clone());
-        if let Some(interval) = self.upload_interval {
-            replicator = replicator.with_upload_interval(interval);
-        }
-        let replicator = Arc::new(replicator);
-
-        // Open database: use external database if provided, otherwise open locally.
-        let db = match self.external_db {
-            Some(ext_db) => ext_db,
-            None => Arc::new(open_database(&db_path, schema)?),
-        };
-
-        // Create or use pre-provided locks.
-        let (write_mutex, snapshot_lock) = match self.external_locks {
-            Some(locks) => locks,
-            None => (
-                Arc::new(tokio::sync::Mutex::new(())),
-                Arc::new(std::sync::RwLock::new(())),
-            ),
-        };
-
-        // Build follower behavior, shares locks with HaKuzuInner for replay serialization.
-        let follower_behavior = Arc::new(
-            KuzuFollowerBehavior::new(object_store.clone())
-                .with_shared_db(db.clone())
-                .with_locks(write_mutex.clone(), snapshot_lock.clone()),
-        );
-
-        // Build snapshot context for leader.
-        let snapshot_ctx = self.snapshot_interval.map(|interval| SnapshotContext {
-            config: SnapshotConfig {
-                interval,
-                every_n_entries: self
-                    .snapshot_every_n_entries
-                    .unwrap_or(DEFAULT_SNAPSHOT_EVERY_N_ENTRIES),
-            },
-            s3_client: s3_client.clone(),
-            bucket: self.bucket.clone(),
-            prefix: self.prefix.clone(),
-            db_path: db_path.clone(),
-        });
-
-        // Build coordinator.
-        let mut config = self.coordinator_config.unwrap_or_default();
-        config.lease = Some(LeaseConfig::new(instance_id.clone(), address.clone()));
-
-        let coordinator = Coordinator::new(
-            replicator.clone(),
-            Some(lease_store),
-            None,
-            None, // node_registry
-            follower_behavior,
-            &self.prefix,
-            config,
-        );
-
-        open_with_coordinator(
-            coordinator,
-            replicator,
-            db,
-            db_path,
-            &db_name,
-            &address,
-            self.forwarding_port,
-            self.forward_timeout,
-            self.secret,
-            snapshot_ctx,
-            Some((write_mutex, snapshot_lock)),
-            self.read_concurrency,
-        )
-        .await
-    }
-}
-
 /// HA Kuzu database — transparent write forwarding, local reads, automatic failover.
 pub struct HaKuzu {
-    inner: Arc<HaKuzuInner>,
+    pub(crate) inner: Arc<HaKuzuInner>,
     _fwd_handle: tokio::task::JoinHandle<()>,
     _role_handle: tokio::task::JoinHandle<()>,
 }
@@ -412,7 +59,8 @@ pub struct HaKuzu {
 /// Internal state shared between HaKuzu, forwarding handler, and role listener.
 pub(crate) struct HaKuzuInner {
     pub(crate) coordinator: Option<Arc<Coordinator>>,
-    pub(crate) replicator: Option<Arc<KuzuReplicator>>,
+    pub(crate) replicator: Option<Arc<dyn hadb::Replicator>>,
+    pub(crate) durability: Durability,
     pub(crate) db: Arc<lbug::Database>,
     pub(crate) db_name: String,
     role: AtomicU8,
@@ -458,11 +106,11 @@ impl HaKuzuInner {
         *self.leader_address.write().unwrap_or_else(|e| e.into_inner()) = addr;
     }
 
-    fn set_journal_sender(&self, sender: Option<JournalSender>) {
+    pub(crate) fn set_journal_sender(&self, sender: Option<JournalSender>) {
         *self.journal_sender.write().unwrap_or_else(|e| e.into_inner()) = sender;
     }
 
-    fn get_journal_sender(&self) -> Option<JournalSender> {
+    pub(crate) fn get_journal_sender(&self) -> Option<JournalSender> {
         self.journal_sender.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
@@ -479,7 +127,7 @@ impl HaKuzuInner {
         let write_start = std::time::Instant::now();
         // write_mutex serializes all writes. Also held during snapshot seal
         // (see snapshot_loop.rs) to prevent writes during checkpoint.
-        // Phase GraphMeridian: turbograph_sync() will also run under this lock.
+        // Phase GraphMeridian: turbograph_sync() also runs under this lock.
         let _guard = self.write_mutex.lock().await;
 
         // Rewrite non-deterministic functions before execution.
@@ -515,20 +163,38 @@ impl HaKuzuInner {
         .await
         .map_err(|e| anyhow!("Task panicked: {e}"))??;
 
-        // Journal the rewritten query + merged params (not the original).
-        // If journaling fails, the write already executed locally — this is a critical
-        // consistency violation (local state diverged from journal). Surface it loudly.
-        if let Some(tx) = self.get_journal_sender() {
-            let gs_params = match &merged_params {
-                Some(p) => values::json_params_to_graphstream(p),
-                None => vec![],
-            };
-            let entry = PendingEntry {
-                query: rewrite.query,
-                params: gs_params,
-            };
-            if tx.send(JournalCommand::Write(entry)).is_err() {
-                return Err(anyhow!("Failed to send journal entry — writer may have crashed"));
+        // Make the write durable based on the durability mode.
+        match self.durability {
+            Durability::Replicated => {
+                // Journal the rewritten query + merged params (not the original).
+                // If journaling fails, the write already executed locally — this is
+                // a critical consistency violation (local diverged from journal).
+                if let Some(tx) = self.get_journal_sender() {
+                    let gs_params = match &merged_params {
+                        Some(p) => values::json_params_to_graphstream(p),
+                        None => vec![],
+                    };
+                    let entry = PendingEntry {
+                        query: rewrite.query,
+                        params: gs_params,
+                    };
+                    if tx.send(JournalCommand::Write(entry)).is_err() {
+                        return Err(anyhow!(
+                            "Failed to send journal entry — writer may have crashed"
+                        ));
+                    }
+                }
+            }
+            Durability::Synchronous => {
+                // RPO=0: flush dirty pages to S3 via turbograph_sync() after every
+                // write. The write is only considered durable once S3 confirms.
+                // The write_mutex is still held, so no concurrent writes can interleave.
+                if let Some(ref replicator) = self.replicator {
+                    replicator
+                        .sync(&self.db_name)
+                        .await
+                        .map_err(|e| anyhow!("turbograph_sync after write failed: {e}"))?;
+                }
             }
         }
 
@@ -552,6 +218,7 @@ impl HaKuzu {
         let inner = Arc::new(HaKuzuInner {
             coordinator: None,
             replicator: None,
+            durability: Durability::Replicated,
             db,
             db_name: db_path
                 .file_name()
@@ -560,7 +227,7 @@ impl HaKuzu {
                 .to_string(),
             role: AtomicU8::new(ROLE_LEADER),
             write_mutex: Arc::new(tokio::sync::Mutex::new(())),
-            read_semaphore: tokio::sync::Semaphore::new(DEFAULT_READ_CONCURRENCY),
+            read_semaphore: tokio::sync::Semaphore::new(crate::builder::DEFAULT_READ_CONCURRENCY),
             snapshot_lock: Arc::new(std::sync::RwLock::new(())),
             journal_sender: RwLock::new(None),
             leader_address: RwLock::new(String::new()),
@@ -620,9 +287,12 @@ impl HaKuzu {
         let db_path = PathBuf::from(db_path);
         let address = format!("http://localhost:{}", forwarding_port);
 
+        let replicator_trait: Arc<dyn hadb::Replicator> = replicator.clone();
         open_with_coordinator(
             coordinator,
-            replicator,
+            replicator_trait,
+            Some(replicator),
+            Durability::Replicated,
             db,
             db_path,
             db_name,
@@ -630,9 +300,10 @@ impl HaKuzu {
             forwarding_port,
             forward_timeout,
             secret,
-            None, // no snapshot config via from_coordinator
-            None, // no pre-created locks
-            DEFAULT_READ_CONCURRENCY,
+            None,   // no snapshot config via from_coordinator
+            None,   // no pre-created locks
+            crate::builder::DEFAULT_READ_CONCURRENCY,
+            None,   // no manifest wakeup (Replicated mode)
         )
         .await
     }
@@ -813,7 +484,6 @@ impl HaKuzu {
 
             // Seal journal segment so all entries are durable before we step down.
             if let Some(ref replicator) = self.inner.replicator {
-                use hadb::Replicator;
                 replicator
                     .sync(&self.inner.db_name)
                     .await
@@ -842,7 +512,6 @@ impl HaKuzu {
             {
                 let _guard = self.inner.write_mutex.lock().await;
                 if let Some(ref replicator) = self.inner.replicator {
-                    use hadb::Replicator;
                     if let Err(e) = replicator.sync(&self.inner.db_name).await {
                         tracing::error!("Failed to seal journal on close: {e}");
                     }
@@ -965,9 +634,20 @@ impl HaKuzu {
 // Shared open logic
 // ============================================================================
 
-async fn open_with_coordinator(
+/// Open an HaKuzu instance with a pre-configured coordinator.
+///
+/// Shared by `HaKuzuBuilder::open()` and `HaKuzu::from_coordinator*()`.
+/// Subscribes to role events, joins the cluster, starts the forwarding server
+/// and role listener tasks.
+///
+/// `manifest_wakeup`: for Synchronous durability mode, a Notify shared with
+/// `TurbographFollowerBehavior` so `ManifestChanged` events immediately wake
+/// the follower loop without waiting for the poll interval.
+pub(crate) async fn open_with_coordinator(
     coordinator: Arc<Coordinator>,
-    replicator: Arc<KuzuReplicator>,
+    replicator: Arc<dyn hadb::Replicator>,
+    kuzu_replicator: Option<Arc<KuzuReplicator>>,
+    durability: Durability,
     db: Arc<lbug::Database>,
     db_path: PathBuf,
     db_name: &str,
@@ -978,6 +658,7 @@ async fn open_with_coordinator(
     snapshot_ctx: Option<SnapshotContext>,
     locks: Option<(Arc<tokio::sync::Mutex<()>>, Arc<std::sync::RwLock<()>>)>,
     read_concurrency: usize,
+    manifest_wakeup: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<HaKuzu> {
     // Subscribe to role events BEFORE join.
     let role_rx = coordinator.role_events();
@@ -1011,7 +692,8 @@ async fn open_with_coordinator(
 
     let inner = Arc::new(HaKuzuInner {
         coordinator: Some(coordinator),
-        replicator: Some(replicator.clone()),
+        replicator: Some(replicator),
+        durability,
         db,
         db_name: db_name.to_string(),
         role: AtomicU8::new(match initial_role {
@@ -1030,10 +712,12 @@ async fn open_with_coordinator(
         follower_replay_position,
     });
 
-    // If leader, grab the journal sender from the replicator.
+    // If leader, grab the journal sender from the KuzuReplicator (Replicated durability only).
     if initial_role == Role::Leader {
-        if let Some(tx) = replicator.journal_sender(db_name).await {
-            inner.set_journal_sender(Some(tx));
+        if let Some(ref kr) = kuzu_replicator {
+            if let Some(tx) = kr.journal_sender(db_name).await {
+                inner.set_journal_sender(Some(tx));
+            }
         }
     }
 
@@ -1058,16 +742,17 @@ async fn open_with_coordinator(
     // Spawn role event listener.
     let role_inner = inner.clone();
     let role_address = address.to_string();
-    let role_replicator = replicator;
+    let role_kuzu_replicator = kuzu_replicator;
     let role_db_name = db_name.to_string();
     let role_handle = tokio::spawn(async move {
         run_role_listener(
             role_rx,
             role_inner,
             role_address,
-            role_replicator,
+            role_kuzu_replicator,
             role_db_name,
             snapshot_ctx,
+            manifest_wakeup,
         )
         .await;
     });
@@ -1087,9 +772,12 @@ async fn run_role_listener(
     mut role_rx: tokio::sync::broadcast::Receiver<RoleEvent>,
     inner: Arc<HaKuzuInner>,
     self_address: String,
-    replicator: Arc<KuzuReplicator>,
+    kuzu_replicator: Option<Arc<KuzuReplicator>>,
     db_name: String,
     snapshot_ctx: Option<SnapshotContext>,
+    // For Synchronous durability: notify the TurbographFollowerBehavior loop
+    // immediately when a new manifest is available, bypassing the poll interval.
+    manifest_wakeup: Option<Arc<tokio::sync::Notify>>,
 ) {
     let mut snapshot_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
     let mut snapshot_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -1102,18 +790,20 @@ async fn run_role_listener(
                 inner.set_leader_addr(self_address.clone());
                 inner.set_role(Role::Leader);
 
-                // Grab journal sender from replicator.
-                if let Some(tx) = replicator.journal_sender(&db_name).await {
-                    inner.set_journal_sender(Some(tx));
+                // Grab journal sender from KuzuReplicator (Replicated durability only).
+                if let Some(ref kr) = kuzu_replicator {
+                    if let Some(tx) = kr.journal_sender(&db_name).await {
+                        inner.set_journal_sender(Some(tx));
+                    }
                 }
 
-                // Start snapshot loop if configured.
-                if let Some(ref ctx) = snapshot_ctx {
+                // Start snapshot loop if configured (Replicated durability only).
+                if let (Some(ref ctx), Some(ref kr)) = (&snapshot_ctx, &kuzu_replicator) {
                     let (tx, rx) = tokio::sync::watch::channel(false);
                     let handle = tokio::spawn(snapshot_loop::run_snapshot_loop(
                         ctx.config.clone(),
                         inner.clone(),
-                        replicator.clone(),
+                        kr.clone(),
                         ctx.s3_client.clone(),
                         ctx.bucket.clone(),
                         ctx.prefix.clone(),
@@ -1141,12 +831,29 @@ async fn run_role_listener(
             }
             Ok(RoleEvent::Sleeping { db_name: name }) => {
                 tracing::info!("HaKuzu: sleeping signal for '{}'", name);
+                inner.set_role(Role::Follower);
+                inner.follower_caught_up.store(false, Ordering::SeqCst);
                 inner.set_journal_sender(None);
                 snapshot_loop::stop_snapshot_loop(&mut snapshot_shutdown, &mut snapshot_handle);
             }
             Ok(RoleEvent::Joined { .. }) => {}
-            Ok(RoleEvent::ManifestChanged { .. }) => {
-                tracing::debug!("HaKuzu: manifest changed (ignored in hakuzu)");
+            Ok(RoleEvent::ManifestChanged { db_name: name, version }) => {
+                // For Synchronous durability: wake the TurbographFollowerBehavior loop
+                // immediately so it applies the new manifest without polling delay.
+                if let Some(ref notify) = manifest_wakeup {
+                    tracing::info!(
+                        "HaKuzu: manifest changed for '{}' v{}, waking follower loop",
+                        name,
+                        version,
+                    );
+                    notify.notify_one();
+                } else {
+                    tracing::debug!(
+                        "HaKuzu: manifest changed for '{}' v{} (Replicated mode, no action)",
+                        name,
+                        version,
+                    );
+                }
             }
             Err(_) => {
                 tracing::error!("HaKuzu: role event channel closed");
@@ -1157,13 +864,12 @@ async fn run_role_listener(
     }
 }
 
-
 // ============================================================================
 // Helpers
 // ============================================================================
 
 /// Open a Kuzu database and apply schema statements.
-fn open_database(db_path: &Path, schema: &str) -> Result<lbug::Database> {
+pub(crate) fn open_database(db_path: &Path, schema: &str) -> Result<lbug::Database> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1186,19 +892,4 @@ fn open_database(db_path: &Path, schema: &str) -> Result<lbug::Database> {
     } // conn dropped here, releasing borrow on db
 
     Ok(db)
-}
-
-/// Auto-detect this node's network address for the forwarding server.
-fn detect_address(instance_id: &str, port: u16) -> String {
-    if let Ok(app_name) = std::env::var("FLY_APP_NAME") {
-        return format!(
-            "http://{}.vm.{}.internal:{}",
-            instance_id, app_name, port
-        );
-    }
-    let hostname = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "localhost".to_string());
-    format!("http://{}:{}", hostname, port)
 }

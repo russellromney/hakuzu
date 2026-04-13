@@ -14,6 +14,7 @@ categories = ["database", "network-programming"]
 hadb = { path = "../hadb/hadb", version = "0.4" }
 hadb-io = { path = "../hadb/hadb-io", version = "0.4", features = ["s3"] }
 hadb-lease-s3 = { path = "../hadb/hadb-lease-s3", version = "0.4" }
+hadb-cli = { path = "../hadb/hadb-cli", version = "0.4" }
 
 # Journal replication
 graphstream = { path = "../graphstream", version = "0.3" }
@@ -60,6 +61,10 @@ tempfile = "3"
 mimalloc = { version = "0.1", default-features = false }
 
 [[bin]]
+name = "hakuzu"
+path = "src/bin/main.rs"
+
+[[bin]]
 name = "hakuzu-ha-experiment"
 path = "src/bin/ha_experiment.rs"
 
@@ -87,4 +92,7 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 filetime = "0.2"
 hadb-changeset = { path = "../hadb-changeset", version = "0.3.2", features = ["journal"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+hyper = "1"
 
