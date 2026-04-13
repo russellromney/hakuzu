@@ -173,17 +173,11 @@ impl Replicator for TurbographReplicator {
             version,
         );
 
-        // Publish the manifest to the ManifestStore so followers can discover it.
-        // Parse the turbograph JSON into structured fields. Followers reconstruct
-        // the JSON from these fields (no opaque blob stored in msgpack).
+        // Publish to ManifestStore if configured.
         if let Some(ref store) = self.manifest_store {
             let manifest_json = match manifest_json {
                 Ok(json) => json,
                 Err(e) => {
-                    // turbograph_get_manifest() unavailable (extension too old).
-                    // The sync itself succeeded (data is durable in S3). Skip
-                    // ManifestStore publication; followers can't discover this
-                    // version until the extension is upgraded.
                     tracing::error!(
                         "TurbographReplicator: turbograph_get_manifest() failed for '{}': {}. \
                          Skipping ManifestStore publication (data is still durable in S3).",
@@ -193,29 +187,56 @@ impl Replicator for TurbographReplicator {
                 }
             };
 
-            let current = store.get(name).await?;
-            let expected_version = current.as_ref().map(|m| m.version);
-
-            let manifest = crate::turbograph_manifest_json::parse_turbograph_json_to_ha_manifest(
-                version as u64,
-                &manifest_json,
-            )?;
-
-            let cas_result = store.put(name, &manifest, expected_version).await?;
-            if !cas_result.success {
-                // CAS failure means another writer published a newer manifest.
-                // In Dedicated mode this is a fencing violation (two leaders).
-                // In Shared mode this is expected contention (retry).
-                // Err on the side of safety: surface the error.
-                return Err(anyhow!(
-                    "TurbographReplicator: manifest CAS failed for '{}' \
-                     (expected version {:?}, another writer is active)",
-                    name,
-                    expected_version,
-                ));
-            }
+            Self::publish_manifest(store, name, version as u64, &manifest_json).await?;
         }
 
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Manifest publication (extracted for testability)
+// ============================================================================
+
+impl TurbographReplicator {
+    /// Publish a manifest to the ManifestStore with CAS fencing.
+    ///
+    /// Extracted from sync() so it can be tested independently without the
+    /// turbograph extension loaded. Parses turbograph JSON into structured
+    /// fields, publishes via CAS put, errors on conflict.
+    pub(crate) async fn publish_manifest(
+        store: &Arc<dyn hadb::ManifestStore>,
+        name: &str,
+        version: u64,
+        manifest_json: &str,
+    ) -> Result<()> {
+        let current = store.get(name).await?;
+        let expected_version = current.as_ref().map(|m| m.version);
+
+        let manifest = crate::turbograph_manifest_json::parse_turbograph_json_to_ha_manifest(
+            version,
+            manifest_json,
+        )?;
+
+        let cas_result = store.put(name, &manifest, expected_version).await?;
+        if !cas_result.success {
+            // CAS failure means another writer published a newer manifest.
+            // In Dedicated mode this is a fencing violation (two leaders).
+            // In Shared mode this is expected contention (retry).
+            // Err on the side of safety: surface the error.
+            return Err(anyhow!(
+                "TurbographReplicator: manifest CAS failed for '{}' \
+                 (expected version {:?}, another writer is active)",
+                name,
+                expected_version,
+            ));
+        }
+
+        tracing::info!(
+            "TurbographReplicator: published manifest v{} for '{}'",
+            version,
+            name,
+        );
         Ok(())
     }
 }
@@ -348,6 +369,96 @@ mod tests {
         assert!(
             err.contains("turbograph_get_manifest_version"),
             "error should mention the UDF: {err}"
+        );
+    }
+
+    // ========================================================================
+    // publish_manifest tests (no extension needed)
+    // ========================================================================
+
+    const SAMPLE_MANIFEST_JSON: &str = r#"{"version":5,"page_count":50,"page_size":4096,"pages_per_group":4096,"page_group_keys":["pg/0_v5","pg/1_v5"]}"#;
+
+    /// publish_manifest succeeds with InMemoryManifestStore.
+    #[tokio::test]
+    async fn publish_manifest_succeeds() {
+        let store: Arc<dyn hadb::ManifestStore> = Arc::new(hadb::InMemoryManifestStore::new());
+        TurbographReplicator::publish_manifest(&store, "db1", 5, SAMPLE_MANIFEST_JSON)
+            .await
+            .expect("publish should succeed on empty store");
+
+        // Verify published.
+        let fetched = store.get("db1").await.unwrap().expect("should exist after publish");
+        assert_eq!(fetched.version, 1); // InMemoryManifestStore assigns version 1 on first put
+        if let hadb::StorageManifest::Turbograph { page_count, page_group_keys, .. } = &fetched.storage {
+            assert_eq!(*page_count, 50);
+            assert_eq!(page_group_keys.len(), 2);
+        } else {
+            panic!("expected Turbograph variant");
+        }
+    }
+
+    /// publish_manifest errors on CAS conflict (fencing violation).
+    #[tokio::test]
+    async fn publish_manifest_cas_failure_errors() {
+        use std::sync::Mutex;
+
+        /// ManifestStore that succeeds on get() but always fails on put().
+        struct FailCasStore {
+            inner: hadb::InMemoryManifestStore,
+            fail_put: Mutex<bool>,
+        }
+
+        #[async_trait::async_trait]
+        impl hadb::ManifestStore for FailCasStore {
+            async fn get(&self, key: &str) -> Result<Option<hadb::HaManifest>> {
+                self.inner.get(key).await
+            }
+            async fn put(
+                &self,
+                _key: &str,
+                _manifest: &hadb::HaManifest,
+                _expected: Option<u64>,
+            ) -> Result<hadb::CasResult> {
+                if *self.fail_put.lock().unwrap() {
+                    Ok(hadb::CasResult { success: false, etag: None })
+                } else {
+                    Ok(hadb::CasResult { success: true, etag: None })
+                }
+            }
+            async fn meta(&self, key: &str) -> Result<Option<hadb::ManifestMeta>> {
+                self.inner.meta(key).await
+            }
+        }
+
+        let store: Arc<dyn hadb::ManifestStore> = Arc::new(FailCasStore {
+            inner: hadb::InMemoryManifestStore::new(),
+            fail_put: Mutex::new(true),
+        });
+
+        let result = TurbographReplicator::publish_manifest(
+            &store, "db1", 5, SAMPLE_MANIFEST_JSON,
+        ).await;
+
+        assert!(result.is_err(), "should fail on CAS conflict");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("CAS failed") && err.contains("another writer"),
+            "error should explain CAS failure: {err}"
+        );
+    }
+
+    /// publish_manifest with invalid JSON errors clearly.
+    #[tokio::test]
+    async fn publish_manifest_invalid_json_errors() {
+        let store: Arc<dyn hadb::ManifestStore> = Arc::new(hadb::InMemoryManifestStore::new());
+        let result = TurbographReplicator::publish_manifest(
+            &store, "db1", 1, "not valid json",
+        ).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid turbograph manifest JSON"),
+            "error should mention invalid JSON: {err}"
         );
     }
 }
