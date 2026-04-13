@@ -120,22 +120,8 @@ impl Replicator for TurbographReplicator {
             anyhow!("TurbographReplicator: no manifest found for '{name}'")
         })?;
 
-        // Extract the raw turbograph manifest JSON from the HaManifest.
-        let json = match &manifest.storage {
-            hadb::StorageManifest::Turbograph { manifest_json, .. }
-                if !manifest_json.is_empty() =>
-            {
-                manifest_json.clone()
-            }
-            _ => {
-                return Err(anyhow!(
-                    "TurbographReplicator: manifest_json is empty for '{}' v{} \
-                     (manifest was published before Phase GraphBridge)",
-                    name,
-                    manifest.version,
-                ));
-            }
-        };
+        // Reconstruct turbograph's internal JSON from the structured fields.
+        let json = crate::turbograph_manifest_json::to_turbograph_json(&manifest.storage)?;
 
         let db = self.db.clone();
         let version = tokio::task::spawn_blocking(move || {
@@ -174,8 +160,7 @@ impl Replicator for TurbographReplicator {
         let (version, manifest_json) = tokio::task::spawn_blocking(move || {
             let replicator = TurbographReplicator { db, manifest_store: None };
             let version = replicator.call_sync()?;
-            // Phase GraphBridge: read the full manifest JSON after sync.
-            // If the UDF isn't available (extension too old), fall back to empty.
+            // Read the full manifest JSON after sync so we can populate structured fields.
             let json = replicator.call_get_manifest().unwrap_or_default();
             Ok::<_, anyhow::Error>((version, json))
         })
@@ -183,44 +168,22 @@ impl Replicator for TurbographReplicator {
         .map_err(|e| anyhow!("TurbographReplicator sync task panicked: {e}"))??;
 
         tracing::info!(
-            "TurbographReplicator: sync for '{}' completed, manifest version = {}, json_len = {}",
+            "TurbographReplicator: sync for '{}' completed, manifest version = {}",
             name,
             version,
-            manifest_json.len(),
         );
 
         // Publish the manifest to the ManifestStore so followers can discover it.
+        // Parse the turbograph JSON into structured fields. Followers reconstruct
+        // the JSON from these fields (no opaque blob stored in msgpack).
         if let Some(ref store) = self.manifest_store {
             let current = store.get(name).await?;
             let expected_version = current.as_ref().map(|m| m.version);
 
-            // Parse simple scalars from the turbograph JSON for monitoring.
-            // The manifest_json blob is the source of truth for followers.
-            let parsed: serde_json::Value = serde_json::from_str(&manifest_json)
-                .unwrap_or_default();
-
-            let manifest = hadb::HaManifest {
-                version: version as u64,
-                writer_id: String::new(),
-                lease_epoch: 0,
-                timestamp_ms: 0,
-                storage: hadb::StorageManifest::Turbograph {
-                    turbograph_version: version as u64,
-                    page_count: parsed["page_count"].as_u64().unwrap_or(0),
-                    page_size: parsed["page_size"].as_u64().unwrap_or(0) as u32,
-                    pages_per_group: parsed["pages_per_group"].as_u64().unwrap_or(0) as u32,
-                    sub_pages_per_frame: parsed["sub_pages_per_frame"].as_u64().unwrap_or(0) as u32,
-                    page_group_keys: parsed["page_group_keys"]
-                        .as_array()
-                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                        .unwrap_or_default(),
-                    frame_tables: vec![],        // populated in manifest_json blob
-                    subframe_overrides: vec![],  // populated in manifest_json blob
-                    encrypted: parsed["encrypted"].as_bool().unwrap_or(false),
-                    journal_seq: parsed["journal_seq"].as_u64().unwrap_or(0),
-                    manifest_json,
-                },
-            };
+            let manifest = crate::turbograph_manifest_json::parse_turbograph_json_to_ha_manifest(
+                version as u64,
+                &manifest_json,
+            )?;
 
             let cas_result = store.put(name, &manifest, expected_version).await?;
             if !cas_result.success {

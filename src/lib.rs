@@ -32,6 +32,7 @@ pub mod serve;
 pub mod snapshot;
 mod snapshot_loop;
 pub mod turbograph_follower_behavior;
+pub mod turbograph_manifest_json;
 pub mod turbograph_replicator;
 pub mod values;
 
