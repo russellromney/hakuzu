@@ -6,6 +6,11 @@
 //! Durability::Synchronous is selected.
 //!
 //! RPO = 0: every sync() call checkpoints + uploads pages to S3 before returning.
+//!
+//! **Requires the turbograph extension to be loaded in the lbug database.**
+//! The crates.io lbug crate does not support extension loading. This module
+//! is wired but non-functional until extension support ships (Phase
+//! GraphMeridian-c). For now, only Durability::Replicated is production-ready.
 
 use std::path::Path;
 use std::sync::Arc;

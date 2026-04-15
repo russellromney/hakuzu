@@ -359,6 +359,8 @@ impl HaKuzuBuilder {
                     (kr.clone(), Some(kr))
                 }
                 Durability::Synchronous => {
+                    // NOTE: Synchronous requires the turbograph extension loaded in lbug.
+                    // Not yet supported via crates.io lbug (Phase GraphMeridian-c).
                     let mut tr = TurbographReplicator::new(db.clone());
                     if let Some(store) = self.manifest_store.clone() {
                         tr = tr.with_manifest_store(store);
