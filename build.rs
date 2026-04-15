@@ -1,13 +1,11 @@
 fn main() {
-    // No special link flags needed.
-    // For turbograph extension loading, see two options:
+    // On macOS, export all global symbols to the dynamic symbol table.
+    // Needed for dynamically-loaded extensions (LOAD EXTENSION) to resolve
+    // lbug C++ symbols at runtime via dlsym.
     //
-    // 1. Dynamic loading (Linux only, macOS has symbol export issues):
-    //    TURBOGRAPH_EXTENSION_PATH=/path/to/libturbograph.lbug_extension
-    //    cargo test --test extension_loading -- --ignored
-    //
-    // 2. Static linking (production, all platforms):
-    //    Build lbug from source with STATICALLY_LINKED_EXTENSIONS=turbograph.
-    //    The extension auto-loads on database init. No LOAD EXTENSION needed.
-    //    See ladybug/extension/turbograph/CMakeLists.txt for build instructions.
+    // Not needed for statically-linked extensions (auto-loaded at db init),
+    // but doesn't hurt and supports both modes.
+    if cfg!(target_os = "macos") {
+        println!("cargo:rustc-link-arg=-Wl,-export_dynamic");
+    }
 }

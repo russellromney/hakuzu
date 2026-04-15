@@ -20,8 +20,8 @@ hadb-manifest-s3 = { path = "../hadb/hadb-manifest-s3", version = "0.4" }
 # Journal replication
 graphstream = { path = "../graphstream", version = "0.3" }
 
-# Kuzu graph database
-lbug = { version = "0.15", default-features = false }
+# Kuzu graph database (local path for static extension support)
+lbug = { path = "../ladybug/tools/rust_api", default-features = false }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

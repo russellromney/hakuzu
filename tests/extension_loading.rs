@@ -1,39 +1,37 @@
-//! Tests that require the turbograph extension shared library.
+//! Tests for turbograph extension UDFs (static or dynamic loading).
 //!
-//! Set TURBOGRAPH_EXTENSION_PATH to the .lbug_extension file path:
-//!   TURBOGRAPH_EXTENSION_PATH=/path/to/libturbograph.lbug_extension \
+//! **Static (recommended):** Build lbug with the extension baked in:
+//!   LBUG_STATIC_EXTENSIONS=turbograph TURBOGRAPH_DIR=~/turbograph \
 //!     cargo test --test extension_loading -- --ignored
 //!
-//! Build the extension from the ladybug tree:
-//!   cd ~/Documents/Github/ladybug
-//!   cmake -B build/release -DCMAKE_BUILD_TYPE=Release \
-//!     -DBUILD_EXTENSIONS="turbograph" \
-//!     -DTURBOGRAPH_DIR=~/Documents/Github/turbograph
-//!   cmake --build build/release --target lbug_turbograph_extension
+//! **Dynamic (Linux only):** Build the .lbug_extension and point to it:
+//!   TURBOGRAPH_EXTENSION_PATH=/path/to/libturbograph.lbug_extension \
+//!     cargo test --test extension_loading -- --ignored
 
 use std::sync::Arc;
 
-fn extension_path() -> String {
-    std::env::var("TURBOGRAPH_EXTENSION_PATH")
-        .expect("TURBOGRAPH_EXTENSION_PATH env var required for extension tests")
-}
-
-fn load_extension(conn: &lbug::Connection) {
-    let path = extension_path();
-    conn.query(&format!("LOAD EXTENSION '{path}'"))
-        .expect("failed to load turbograph extension");
-}
-
+/// Open a database with the turbograph extension loaded.
+///
+/// Two modes:
+/// - **Static** (LBUG_STATIC_EXTENSIONS=turbograph at build time): auto-loads on db init.
+/// - **Dynamic** (TURBOGRAPH_EXTENSION_PATH env var): loads via LOAD EXTENSION SQL.
 fn open_db_with_extension(dir: &std::path::Path) -> Arc<lbug::Database> {
     let db_path = dir.join("db");
     let db = lbug::Database::new(&db_path, lbug::SystemConfig::default())
         .expect("failed to open database");
     {
         let conn = lbug::Connection::new(&db).expect("failed to create connection");
-        load_extension(&conn);
+
+        // Dynamic loading (if env var is set).
+        if let Ok(path) = std::env::var("TURBOGRAPH_EXTENSION_PATH") {
+            conn.query(&format!("LOAD EXTENSION '{path}'"))
+                .expect("failed to load turbograph extension");
+        }
+        // Static: extension auto-loaded at database init, nothing to do.
+
         conn.query("CREATE NODE TABLE IF NOT EXISTS Person(id INT64, name STRING, PRIMARY KEY(id))")
             .expect("schema failed");
-    } // conn dropped, releasing borrow on db
+    }
     Arc::new(db)
 }
 
