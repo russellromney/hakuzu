@@ -438,22 +438,26 @@ mod tests {
         assert_eq!(v, 0);
     }
 
-    /// When extension is not loaded, apply_manifest errors on the UDF call.
-    /// The structured fields get reconstructed into turbograph JSON, but the
-    /// UDF isn't available so the query fails.
+    /// apply_manifest calls the turbograph_set_manifest UDF.
+    /// With static extensions (LBUG_STATIC_EXTENSIONS=turbograph): succeeds.
+    /// Without extensions: fails with UDF-not-found error.
     #[tokio::test]
-    async fn apply_manifest_without_extension_errors() {
+    async fn apply_manifest_with_or_without_extension() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = make_db(tmp.path());
         let store = Arc::new(FixedManifestStore(turbo_manifest(5)));
         let behavior = TurbographFollowerBehavior::new(store, db);
         let result = behavior.apply_latest_manifest("db").await;
-        assert!(result.is_err(), "should fail without turbograph extension loaded");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("turbograph_set_manifest") || err.contains("failed"),
-            "error should mention the UDF: {err}"
-        );
+        match result {
+            Ok(_) => {} // Static extension: UDF available
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("turbograph_set_manifest") || err.contains("failed"),
+                    "error should mention the UDF: {err}"
+                );
+            }
+        }
     }
 
     /// catchup_on_promotion with no manifest is non-fatal.

@@ -97,3 +97,11 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 hyper = "1"
 
+[patch.crates-io]
+# Local lbug with LBUG_STATIC_EXTENSIONS support for turbograph.
+# Upstream lbug doesn't compile extensions. Our build.rs adds env-var-controlled
+# static extension linking. Set LBUG_STATIC_EXTENSIONS=turbograph + TURBOGRAPH_DIR
+# to bake turbograph UDFs into the binary. Without the env var, builds identically
+# to upstream.
+lbug = { path = "../ladybug/tools/rust_api" }
+
