@@ -136,10 +136,9 @@ pub fn extract_snapshot(snapshot_path: &Path, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Upload a snapshot + metadata to S3.
+/// Upload a snapshot + metadata through a [`StorageBackend`].
 pub async fn upload_snapshot(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
+    storage: &dyn hadb_storage::StorageBackend,
     prefix: &str,
     db_name: &str,
     snapshot_path: &Path,
@@ -148,30 +147,18 @@ pub async fn upload_snapshot(
     let snap_key = snapshot_s3_key(prefix, db_name, meta.journal_seq, "tar.zst");
     let meta_key = snapshot_s3_key(prefix, db_name, meta.journal_seq, "meta.json");
 
-    // Upload snapshot tarball.
-    let body = aws_sdk_s3::primitives::ByteStream::from_path(snapshot_path)
+    let snap_bytes = tokio::fs::read(snapshot_path)
         .await
-        .map_err(|e| anyhow!("Read snapshot for upload: {e}"))?;
-
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(&snap_key)
-        .body(body)
-        .send()
+        .map_err(|e| anyhow!("Read snapshot {}: {e}", snapshot_path.display()))?;
+    storage
+        .put(&snap_key, &snap_bytes)
         .await
         .map_err(|e| anyhow!("Upload snapshot: {e}"))?;
 
-    // Upload metadata JSON.
-    let meta_json = serde_json::to_string(meta)
+    let meta_json = serde_json::to_vec(meta)
         .map_err(|e| anyhow!("Serialize snapshot meta: {e}"))?;
-
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(&meta_key)
-        .body(meta_json.into_bytes().into())
-        .send()
+    storage
+        .put(&meta_key, &meta_json)
         .await
         .map_err(|e| anyhow!("Upload snapshot meta: {e}"))?;
 
@@ -185,36 +172,29 @@ pub async fn upload_snapshot(
     Ok(())
 }
 
-/// Find and download the latest snapshot from S3.
+/// Find and download the latest snapshot through a [`StorageBackend`].
 ///
-/// Returns `None` if no snapshots exist. Downloads the tarball to `dest_dir/snapshot.tar.zst`.
+/// Returns `None` if no snapshots exist. Downloads the tarball to
+/// `dest_dir/snapshot.tar.zst`.
 pub async fn download_latest_snapshot(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
+    storage: &dyn hadb_storage::StorageBackend,
     prefix: &str,
     db_name: &str,
     dest_dir: &Path,
 ) -> Result<Option<(PathBuf, SnapshotMeta)>> {
     let snapshot_prefix = format!("{}{}/snapshots/", prefix, db_name);
-
-    // List snapshot metadata files.
-    let list_resp = client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(&snapshot_prefix)
-        .send()
+    let keys = storage
+        .list(&snapshot_prefix, None)
         .await
         .map_err(|e| anyhow!("List snapshots: {e}"))?;
 
-    // Find the latest .meta.json key.
+    // Find the latest .meta.json key by parsed sequence.
     let mut latest_meta_key: Option<(String, u64)> = None;
-    for obj in list_resp.contents() {
-        if let Some(key) = obj.key() {
-            if key.ends_with(".meta.json") {
-                if let Some(seq) = parse_snapshot_seq(key) {
-                    if latest_meta_key.as_ref().map_or(true, |(_, s)| seq > *s) {
-                        latest_meta_key = Some((key.to_string(), seq));
-                    }
+    for key in keys {
+        if key.ends_with(".meta.json") {
+            if let Some(seq) = parse_snapshot_seq(&key) {
+                if latest_meta_key.as_ref().map_or(true, |(_, s)| seq > *s) {
+                    latest_meta_key = Some((key, seq));
                 }
             }
         }
@@ -225,42 +205,20 @@ pub async fn download_latest_snapshot(
         None => return Ok(None),
     };
 
-    // Download metadata.
-    let meta_resp = client
-        .get_object()
-        .bucket(bucket)
-        .key(&meta_key)
-        .send()
+    let meta_bytes = storage
+        .get(&meta_key)
         .await
-        .map_err(|e| anyhow!("Download snapshot meta: {e}"))?;
-
-    let meta_bytes = meta_resp
-        .body
-        .collect()
-        .await
-        .map_err(|e| anyhow!("Read snapshot meta: {e}"))?
-        .into_bytes();
-
+        .map_err(|e| anyhow!("Download snapshot meta: {e}"))?
+        .ok_or_else(|| anyhow!("snapshot meta key {meta_key} disappeared between list and get"))?;
     let meta: SnapshotMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| anyhow!("Parse snapshot meta: {e}"))?;
 
-    // Download the tarball.
     let snap_key = snapshot_s3_key(prefix, db_name, seq, "tar.zst");
-
-    let snap_resp = client
-        .get_object()
-        .bucket(bucket)
-        .key(&snap_key)
-        .send()
+    let snap_bytes = storage
+        .get(&snap_key)
         .await
-        .map_err(|e| anyhow!("Download snapshot: {e}"))?;
-
-    let snap_bytes = snap_resp
-        .body
-        .collect()
-        .await
-        .map_err(|e| anyhow!("Read snapshot body: {e}"))?
-        .into_bytes();
+        .map_err(|e| anyhow!("Download snapshot: {e}"))?
+        .ok_or_else(|| anyhow!("snapshot tarball key {snap_key} not found"))?;
 
     std::fs::create_dir_all(dest_dir)?;
     let local_path = dest_dir.join("snapshot.tar.zst");

@@ -10,9 +10,13 @@ keywords = ["kuzu", "graph-database", "ha", "replication", "leader-election"]
 categories = ["database", "network-programming"]
 
 [dependencies]
-# HA coordination framework
+# HA coordination framework (Phase Anvil: trait crates + S3 impls). Embedders
+# that want Cinch HTTP pass in their own `hadb_storage_cinch::CinchHttpStorage`
+# / `hadb_lease_cinch::CinchHttpLeaseStore` via `.storage()` / `.lease_store()`
+# / `.manifest_store()`; hakuzu itself only knows the traits and the S3 default.
 hadb = { path = "../hadb/hadb", version = "0.4" }
-hadb-io = { path = "../hadb/hadb-io", version = "0.4", features = ["s3"] }
+hadb-storage = { path = "../hadb/hadb-storage", version = "0.4" }
+hadb-storage-s3 = { path = "../hadb/hadb-storage-s3", version = "0.4" }
 hadb-lease-s3 = { path = "../hadb/hadb-lease-s3", version = "0.4" }
 hadb-cli = { path = "../hadb/hadb-cli", version = "0.4" }
 hadb-manifest-s3 = { path = "../hadb/hadb-manifest-s3", version = "0.4" }
@@ -54,6 +58,9 @@ hex = "0.4"
 # Hostname
 hostname = "0.4"
 uuid = { version = "1", features = ["v4"] }
+
+# Date/time parsing for journal replay (shared types with lbug)
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
 
 # Temp dirs (for bench binaries)
 tempfile = "3"

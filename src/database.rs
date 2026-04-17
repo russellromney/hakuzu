@@ -403,6 +403,44 @@ impl HaKuzu {
         Ok(qr)
     }
 
+    /// Get the journal sender for this database, if any.
+    ///
+    /// Returns `Some(sender)` when this node is actively journaling mutations
+    /// (replicated-durability leader). Returns `None` on followers, in local
+    /// mode, or during role transitions.
+    ///
+    /// External callers (e.g. the cinch-engine bolt server) use this together
+    /// with [`rewriter::rewrite_query`] to faithfully capture mutations into
+    /// the graphstream journal. See [`StagedJournalEntry`] for the correct
+    /// ordering (rewrite → execute → stage → commit-on-transaction-commit).
+    pub fn journal_sender(&self) -> Option<JournalSender> {
+        self.inner.get_journal_sender()
+    }
+
+    /// Stage a pending journal entry without sending it to the writer yet.
+    ///
+    /// The returned [`StagedJournalEntry`] can be committed on successful
+    /// transaction commit, or dropped to discard (rollback/failure path).
+    /// Returns `None` if this node has no active journal sender.
+    ///
+    /// The caller is responsible for having already run the **rewritten**
+    /// query against the local database before staging. The journal entry
+    /// is what a follower will execute, so it must match what the leader did.
+    pub fn stage_journal_entry(
+        &self,
+        rewritten_query: String,
+        params: Vec<(String, graphstream::types::ParamValue)>,
+    ) -> Option<StagedJournalEntry> {
+        let tx = self.inner.get_journal_sender()?;
+        Some(StagedJournalEntry {
+            entry: PendingEntry {
+                query: rewritten_query,
+                params,
+            },
+            tx,
+        })
+    }
+
     /// Get the current role of this node.
     pub fn role(&self) -> Option<Role> {
         self.inner.current_role()
@@ -416,6 +454,21 @@ impl HaKuzu {
     /// Access the underlying Coordinator.
     pub fn coordinator(&self) -> Option<&Arc<Coordinator>> {
         self.inner.coordinator.as_ref()
+    }
+
+    /// Simulate a process crash for tests: abort all coordinator tasks for
+    /// this database WITHOUT releasing its lease, so another node only takes
+    /// over after the TTL expires.
+    ///
+    /// Intended for crash-recovery tests that need to observe the real
+    /// lease-expiry path, not the graceful-shutdown fast path. Do not use in
+    /// production. The local database is left open, the lease file is
+    /// untouched, and the only way out is to drop the whole HaKuzu.
+    #[doc(hidden)]
+    pub async fn abort_tasks_for_test(&self) {
+        if let Some(coord) = self.inner.coordinator.as_ref() {
+            coord.abort_tasks_for_test().await;
+        }
     }
 
     /// Whether this node is ready to serve reads.
@@ -631,6 +684,32 @@ impl HaKuzu {
     }
 }
 
+/// A journal entry that has been prepared but not yet sent to the writer.
+///
+/// The leader-side write path is:
+///   1. Rewrite the query ([`rewriter::rewrite_query`]).
+///   2. Execute the rewritten query on the local database.
+///   3. Stage a [`StagedJournalEntry`] holding the same rewritten query + merged params.
+///   4. On successful transaction commit, call [`StagedJournalEntry::commit`].
+///      On rollback or failure, drop it; dropping is the discard path.
+///
+/// Separating stage from commit lets the bolt server buffer mutations across
+/// a BEGIN / COMMIT block so a ROLLBACK discards them cleanly instead of
+/// replicating writes the leader never applied.
+pub struct StagedJournalEntry {
+    entry: PendingEntry,
+    tx: JournalSender,
+}
+
+impl StagedJournalEntry {
+    /// Send the entry to the journal writer. Consumes self.
+    pub fn commit(self) -> Result<()> {
+        self.tx
+            .send(JournalCommand::Write(self.entry))
+            .map_err(|_| anyhow!("journal writer has crashed"))
+    }
+}
+
 // ============================================================================
 // Shared open logic
 // ============================================================================
@@ -805,8 +884,7 @@ async fn run_role_listener(
                         ctx.config.clone(),
                         inner.clone(),
                         kr.clone(),
-                        ctx.s3_client.clone(),
-                        ctx.bucket.clone(),
+                        ctx.storage.clone(),
                         ctx.prefix.clone(),
                         name.clone(),
                         ctx.db_path.clone(),

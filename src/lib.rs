@@ -38,7 +38,7 @@ pub mod values;
 
 // Primary API.
 pub use builder::HaKuzuBuilder;
-pub use database::{HaKuzu, QueryResult, SnapshotConfig};
+pub use database::{HaKuzu, QueryResult, SnapshotConfig, StagedJournalEntry};
 pub use error::HakuzuError;
 pub use metrics::HakuzuMetrics;
 pub use hadb::{Durability, HaMode, validate_mode_durability};
@@ -56,3 +56,7 @@ pub use hadb::{
 
 // Re-export hadb-s3 implementations.
 pub use hadb_lease_s3::{S3LeaseStore, S3NodeRegistry, S3StorageBackend};
+
+// Re-export the byte-level storage trait so embedders can name `Arc<dyn StorageBackend>`
+// without taking a direct `hadb-storage` dep.
+pub use hadb_storage::{CasResult, StorageBackend};

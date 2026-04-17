@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use graphstream::journal::{self, JournalCommand, JournalSender, JournalState};
 use graphstream::uploader::{spawn_journal_uploader, UploadMessage};
 use hadb::Replicator;
+use hadb_storage::StorageBackend;
 
 /// Per-database replication state.
 struct KuzuDbState {
@@ -30,10 +31,12 @@ struct KuzuDbState {
 /// Kuzu replicator wrapping graphstream.
 ///
 /// Handles journal replication via .hadbj files (hadb-changeset binary format).
+/// Byte-level I/O goes through a [`hadb_storage::StorageBackend`] provided by
+/// the embedder: typically [`hadb_storage_cinch::CinchHttpStorage`] in
+/// production or [`hadb_storage_s3::S3Storage`] for direct S3.
 pub struct KuzuReplicator {
     prefix: String,
-    /// ObjectStore for upload + pull operations.
-    object_store: Arc<dyn hadb_io::ObjectStore>,
+    storage: Arc<dyn StorageBackend>,
     /// Segment max bytes before rotation (default 4MB).
     segment_max_bytes: u64,
     /// Fsync interval in ms (default 100ms).
@@ -44,10 +47,10 @@ pub struct KuzuReplicator {
 }
 
 impl KuzuReplicator {
-    pub fn new(object_store: Arc<dyn hadb_io::ObjectStore>, prefix: String) -> Self {
+    pub fn new(storage: Arc<dyn StorageBackend>, prefix: String) -> Self {
         Self {
             prefix,
-            object_store,
+            storage,
             segment_max_bytes: 4 * 1024 * 1024, // 4MB
             fsync_ms: 100,
             upload_interval: Duration::from_secs(10),
@@ -109,7 +112,7 @@ impl Replicator for KuzuReplicator {
         let (upload_tx, uploader_handle) = spawn_journal_uploader(
             journal_tx.clone(),
             journal_dir,
-            self.object_store.clone(),
+            self.storage.clone(),
             self.prefix.clone(),
             name.to_string(),
             self.upload_interval,
@@ -136,7 +139,7 @@ impl Replicator for KuzuReplicator {
             .map_err(|e| anyhow::anyhow!("Failed to create journal dir: {e}"))?;
 
         // Download all journal segments from object store.
-        match graphstream::download_new_segments(&*self.object_store, &self.prefix, name, &journal_dir, 0).await {
+        match graphstream::download_new_segments(&*self.storage, &self.prefix, name, &journal_dir, 0).await {
             Ok(segments) => {
                 tracing::info!("KuzuReplicator: pulled {} journal segments for '{}'", segments.len(), name);
             }

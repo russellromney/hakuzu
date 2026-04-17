@@ -158,7 +158,14 @@ pub fn json_params_to_graphstream(params: &Value) -> Vec<(String, ParamValue)> {
         .collect()
 }
 
-fn json_to_param_value(v: &Value) -> ParamValue {
+/// Convert a single JSON value to a graphstream ParamValue.
+///
+/// Used by external callers that need to merge rewriter-generated params
+/// (which are always serde_json::Value for UUIDs, ISO timestamps, etc.) into
+/// a bolt-derived `Vec<(String, ParamValue)>`. The rewriter only emits scalar
+/// JSON, so the Object → nested Map branch exists for generality rather than
+/// being hit in practice.
+pub fn json_to_param_value(v: &Value) -> ParamValue {
     match v {
         Value::Null => ParamValue::Null,
         Value::Bool(b) => ParamValue::Bool(*b),
@@ -178,7 +185,11 @@ fn json_to_param_value(v: &Value) -> ParamValue {
         }
         Value::String(s) => ParamValue::String(s.clone()),
         Value::Array(arr) => ParamValue::List(arr.iter().map(json_to_param_value).collect()),
-        Value::Object(_) => ParamValue::String(serde_json::to_string(v).expect("JSON object must serialize")),
+        Value::Object(obj) => ParamValue::Map(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), json_to_param_value(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -343,14 +354,18 @@ mod tests {
     }
 
     #[test]
-    fn test_param_value_object_becomes_json_string() {
+    fn test_param_value_object_becomes_map() {
+        // graphstream::ParamValue gained a native Map variant; we no longer
+        // serialize nested objects to JSON strings, which previously caused
+        // silent type loss on replay.
         let val = json!({"nested": true});
         match json_to_param_value(&val) {
-            ParamValue::String(s) => {
-                let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
-                assert_eq!(parsed["nested"], true);
+            ParamValue::Map(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].0, "nested");
+                assert!(matches!(entries[0].1, ParamValue::Bool(true)));
             }
-            other => panic!("Expected String (serialized JSON), got {:?}", other),
+            other => panic!("Expected Map, got {:?}", other),
         }
     }
 

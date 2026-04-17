@@ -1,5 +1,24 @@
 # hakuzu Changelog
 
+## Phase GraphForge: hadb-storage Trait Migration
+
+> After: Phase Cascade . Before: Phase GraphCinch (cinch-cloud)
+
+Builder now accepts an `Arc<dyn hadb_storage::StorageBackend>` via a new
+`.storage()` knob, defaulting to `hadb_storage_s3::S3Storage` built from the
+builder's bucket/endpoint when absent. Embedders targeting the Cinch HTTP
+protocol (cinch-engine, future customer SDKs) pass in `CinchHttpStorage` with
+a `FenceSource` wired to the coordinator's lease. No more raw
+`aws_sdk_s3::Client` in the replicator or snapshot paths.
+
+- `KuzuReplicator`, `KuzuFollowerBehavior`, snapshot upload/download, and
+  `SnapshotContext` all take `Arc<dyn StorageBackend>`.
+- `hadb_io` dep deleted.
+- Re-exported `hadb_storage::{CasResult, StorageBackend}` from `lib.rs`.
+- Public re-export of `database::StagedJournalEntry` for the bolt-server
+  staged-commit flow (used in cinch-engine's Phase GraphDurability).
+- 167 lib tests green.
+
 ## Phase Cascade: ObjectStore Migration
 
 Migrated hakuzu from raw S3 client to `ObjectStore` trait (aligned with graphstream Phase Aether).

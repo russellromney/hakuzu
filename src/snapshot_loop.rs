@@ -12,6 +12,7 @@ use anyhow::anyhow;
 use crate::database::{HaKuzuInner, SnapshotConfig};
 use crate::replicator::KuzuReplicator;
 use crate::snapshot;
+use hadb_storage::StorageBackend;
 
 /// Remove a directory, logging any errors instead of silently dropping them.
 fn remove_dir_logged(path: &std::path::Path) {
@@ -23,8 +24,7 @@ fn remove_dir_logged(path: &std::path::Path) {
 /// Internal snapshot context passed to the role listener.
 pub(crate) struct SnapshotContext {
     pub(crate) config: SnapshotConfig,
-    pub(crate) s3_client: aws_sdk_s3::Client,
-    pub(crate) bucket: String,
+    pub(crate) storage: Arc<dyn StorageBackend>,
     pub(crate) prefix: String,
     pub(crate) db_path: PathBuf,
 }
@@ -45,8 +45,7 @@ pub(crate) async fn run_snapshot_loop(
     config: SnapshotConfig,
     inner: Arc<HaKuzuInner>,
     replicator: Arc<KuzuReplicator>,
-    s3_client: aws_sdk_s3::Client,
-    bucket: String,
+    storage: Arc<dyn StorageBackend>,
     prefix: String,
     db_name: String,
     db_path: PathBuf,
@@ -174,7 +173,7 @@ pub(crate) async fn run_snapshot_loop(
                 };
 
                 if let Err(e) = snapshot::upload_snapshot(
-                    &s3_client, &bucket, &prefix, &db_name, &snap_path, &meta,
+                    &*storage, &prefix, &db_name, &snap_path, &meta,
                 )
                 .await
                 {

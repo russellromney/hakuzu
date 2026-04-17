@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use hadb::{Coordinator, CoordinatorConfig, LeaseConfig};
 use hadb_lease_s3::S3LeaseStore;
+use hadb_storage::StorageBackend;
 
 use crate::database::{HaKuzu, SnapshotConfig, open_database, open_with_coordinator};
 use crate::follower_behavior::KuzuFollowerBehavior;
@@ -39,6 +40,10 @@ pub struct HaKuzuBuilder {
     snapshot_every_n_entries: Option<u64>,
     read_concurrency: usize,
     custom_lease_store: Option<Arc<dyn hadb::LeaseStore>>,
+    /// External storage backend. When `Some`, hakuzu uses this for both
+    /// journal segment upload/pull AND snapshot upload/download. When `None`,
+    /// a default S3Storage is constructed from `bucket`/`endpoint`.
+    custom_storage: Option<Arc<dyn StorageBackend>>,
     external_db: Option<Arc<lbug::Database>>,
     external_locks: Option<(Arc<tokio::sync::Mutex<()>>, Arc<std::sync::RwLock<()>>)>,
     ha_mode: HaMode,
@@ -63,12 +68,23 @@ impl HaKuzuBuilder {
             snapshot_every_n_entries: None,
             read_concurrency: DEFAULT_READ_CONCURRENCY,
             custom_lease_store: None,
+            custom_storage: None,
             external_db: None,
             external_locks: None,
             ha_mode: HaMode::default(),
             durability: Durability::default(),
             manifest_store: None,
         }
+    }
+
+    /// Provide an explicit [`StorageBackend`] implementation for journal
+    /// segment and snapshot I/O. Embedders that want to drive hakuzu through
+    /// Cinch HTTP (the default wire protocol in cinch-cloud) construct a
+    /// `CinchHttpStorage` and pass it here. If omitted, hakuzu builds an
+    /// `S3Storage` from `bucket` / `endpoint`.
+    pub fn storage(mut self, storage: Arc<dyn StorageBackend>) -> Self {
+        self.custom_storage = Some(storage);
+        self
     }
 
     /// S3 key prefix for all hakuzu data. Default: "hakuzu/".
@@ -253,22 +269,33 @@ impl HaKuzuBuilder {
             detect_address(&instance_id, self.forwarding_port)
         });
 
-        // Always build S3 client. Even when lease store and database are both
-        // external, the KuzuReplicator (Replicated mode) needs it for journal uploads.
-        let s3_config = match &self.endpoint {
-            Some(endpoint) => {
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .endpoint_url(endpoint)
-                    .load()
-                    .await
-            }
+        // Resolve the StorageBackend. If the caller handed us one via
+        // `.storage()` (the cinch-engine path: CinchHttpStorage with a
+        // FenceSource), use it. Otherwise build an S3Storage from
+        // bucket/endpoint.
+        let storage: Arc<dyn StorageBackend> = match self.custom_storage {
+            Some(storage) => storage,
             None => {
-                aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .load()
-                    .await
+                let s3_config = match &self.endpoint {
+                    Some(endpoint) => {
+                        aws_config::defaults(aws_config::BehaviorVersion::latest())
+                            .endpoint_url(endpoint)
+                            .load()
+                            .await
+                    }
+                    None => {
+                        aws_config::defaults(aws_config::BehaviorVersion::latest())
+                            .load()
+                            .await
+                    }
+                };
+                let s3_client = aws_sdk_s3::Client::new(&s3_config);
+                Arc::new(hadb_storage_s3::S3Storage::new(
+                    s3_client,
+                    self.bucket.clone(),
+                ))
             }
         };
-        let s3_client = aws_sdk_s3::Client::new(&s3_config);
 
         // Snapshot bootstrap: skip when using an external database (caller
         // is responsible for the database state).
@@ -281,8 +308,7 @@ impl HaKuzuBuilder {
                     .unwrap_or(&db_path)
                     .join("snapshots_tmp");
                 match snapshot::download_latest_snapshot(
-                    &s3_client,
-                    &self.bucket,
+                    &*storage,
                     &self.prefix,
                     &db_name,
                     &snap_dest,
@@ -329,16 +355,29 @@ impl HaKuzuBuilder {
             }
         }
 
-        // Resolve lease store: explicit custom store, or build S3LeaseStore.
+        // Resolve lease store: explicit custom store, or build S3LeaseStore
+        // against a freshly-constructed S3 client. The Cinch path provides
+        // its own lease store (CinchHttpLeaseStore) via .lease_store().
         let lease_store: Arc<dyn hadb::LeaseStore> = match self.custom_lease_store {
             Some(store) => store,
-            None => Arc::new(S3LeaseStore::new(s3_client.clone(), self.bucket.clone())),
+            None => {
+                let s3_config = match &self.endpoint {
+                    Some(endpoint) => {
+                        aws_config::defaults(aws_config::BehaviorVersion::latest())
+                            .endpoint_url(endpoint)
+                            .load()
+                            .await
+                    }
+                    None => {
+                        aws_config::defaults(aws_config::BehaviorVersion::latest())
+                            .load()
+                            .await
+                    }
+                };
+                let s3_client = aws_sdk_s3::Client::new(&s3_config);
+                Arc::new(S3LeaseStore::new(s3_client, self.bucket.clone()))
+            }
         };
-
-        // Build shared ObjectStore for replicator + follower behavior.
-        let object_store: Arc<dyn hadb_io::ObjectStore> = Arc::new(
-            hadb_io::S3Backend::new(s3_client.clone(), self.bucket.clone()),
-        );
 
         // Open database: use external database if provided, otherwise open locally.
         // NOTE: database must be opened before TurbographReplicator (needs Arc<lbug::Database>).
@@ -351,7 +390,7 @@ impl HaKuzuBuilder {
         let (replicator, kuzu_replicator): (Arc<dyn hadb::Replicator>, Option<Arc<KuzuReplicator>>) =
             match self.durability {
                 Durability::Replicated => {
-                    let mut kr = KuzuReplicator::new(object_store.clone(), self.prefix.clone());
+                    let mut kr = KuzuReplicator::new(storage.clone(), self.prefix.clone());
                     if let Some(interval) = self.upload_interval {
                         kr = kr.with_upload_interval(interval);
                     }
@@ -389,7 +428,7 @@ impl HaKuzuBuilder {
             match self.durability {
                 Durability::Replicated => {
                     let fb = Arc::new(
-                        KuzuFollowerBehavior::new(object_store.clone())
+                        KuzuFollowerBehavior::new(storage.clone())
                             .with_shared_db(db.clone())
                             .with_locks(write_mutex.clone(), snapshot_lock.clone()),
                     );
@@ -420,8 +459,7 @@ impl HaKuzuBuilder {
                             .snapshot_every_n_entries
                             .unwrap_or(DEFAULT_SNAPSHOT_EVERY_N_ENTRIES),
                     },
-                    s3_client: s3_client.clone(),
-                    bucket: self.bucket.clone(),
+                    storage: storage.clone(),
                     prefix: self.prefix.clone(),
                     db_path: db_path.clone(),
                 })

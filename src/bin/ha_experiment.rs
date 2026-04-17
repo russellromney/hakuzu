@@ -340,11 +340,11 @@ async fn main() -> Result<()> {
         info!("Schema applied");
     }
 
-    // Build S3 client + ObjectStore.
+    // Build S3 client + StorageBackend (experiment binary uses S3 directly).
     let s3_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let s3_client = aws_sdk_s3::Client::new(&s3_config);
-    let object_store: Arc<dyn hadb_io::ObjectStore> = Arc::new(
-        hadb_io::S3Backend::new(s3_client.clone(), args.bucket.clone()),
+    let storage: Arc<dyn hadb_storage::StorageBackend> = Arc::new(
+        hadb_storage_s3::S3Storage::new(s3_client.clone(), args.bucket.clone()),
     );
 
     // Create HA components.
@@ -352,12 +352,12 @@ async fn main() -> Result<()> {
         Arc::new(S3LeaseStore::new(s3_client.clone(), args.bucket.clone()));
 
     let replicator = Arc::new(
-        KuzuReplicator::new(object_store.clone(), args.prefix.clone())
+        KuzuReplicator::new(storage.clone(), args.prefix.clone())
             .with_upload_interval(Duration::from_millis(args.sync_interval_ms)),
     );
 
     let follower_behavior: Arc<dyn hadb::FollowerBehavior> = Arc::new(
-        KuzuFollowerBehavior::new(object_store)
+        KuzuFollowerBehavior::new(storage)
             .with_shared_db(shared_db.clone()),
     );
 
