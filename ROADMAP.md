@@ -94,6 +94,66 @@ Close the gap.
 
 ---
 
+## Phase GraphTurbogenesis: Track cinch's `turbothing` extraction
+
+> After: cinch Phase Turbogenesis (in flight, not yet landed)
+
+cinch-cloud's Phase Turbogenesis pulls manifest types + the
+`ManifestStore` trait out of `hadb` core and into a new `turbothing`
+crate family. hadb shrinks to pure coordination; `turbolite` /
+`turbograph` / future `turboduck` share the commit format.
+
+hakuzu's `TurbographReplicator` / `TurbographFollowerBehavior` /
+builder currently hold `Arc<dyn hadb::ManifestStore>`. Once
+Turbogenesis lands, that trait lives in `turbothing`. This phase is
+the mechanical migration on the hakuzu side.
+
+This is **not** a redesign. Types keep the same method shapes (per
+cinch Phase Turbogenesis "Target shape" — `HaManifest` → `Manifest`,
+`StorageManifest` → `Backend` are renames). Just an import pass.
+
+### a. Follow the crate move
+
+- [ ] `Cargo.toml`: swap `hadb-manifest-s3 = ...` for
+  `turbothing-manifest-s3 = ...` (and any other manifest-store impl
+  crates if we add them — `turbothing-manifest-cinch` for cinch
+  deployments, `turbothing-manifest-nats` for self-hosted NATS KV
+  manifest stores)
+- [ ] `src/builder.rs`: `Option<Arc<dyn hadb::ManifestStore>>` →
+  `Option<Arc<dyn turbothing::ManifestStore>>`
+- [ ] `src/turbograph_replicator.rs` +
+  `src/turbograph_follower_behavior.rs`: same trait-object type swap
+- [ ] `src/lib.rs`: re-export `turbothing::ManifestStore` (or drop
+  the re-export if callers should depend on turbothing directly)
+- [ ] `tests/graph_meridian.rs`: `hadb::InMemoryManifestStore` →
+  whatever turbothing names its in-memory impl
+
+### b. Align tests
+
+- [ ] Every test that constructs a manifest store moves to the
+  turbothing equivalent. No behavior change expected.
+- [ ] Confirm `cargo test --workspace` still green.
+
+### c. Defer to Phase TurbographRust
+
+- [ ] `src/turbograph_manifest_json.rs` stays for now — it exists
+  because turbograph is C++ today and writes a JSON manifest that
+  hakuzu has to parse across the language boundary. Once
+  **TurbographRust** lands (Phase TurbographRust in cinch ROADMAP),
+  turbograph speaks `turbothing::Manifest` directly and this file
+  can be deleted. Flagged here so we remember.
+
+### d. Acceptance
+
+- [ ] `cargo tree -p hakuzu | grep hadb-manifest` returns zero lines.
+- [ ] `cargo tree -p hakuzu | grep turbothing` returns the manifest
+  impl crates.
+- [ ] No mention of `hadb::ManifestStore` in hakuzu source.
+- [ ] `grep StorageManifest src/` returns zero results (the variant
+  name moved to `turbothing::Backend`).
+
+---
+
 ## Phase GraphGuardrail: Fence tokens on journal segment writes
 
 > After: Phase GraphRedline
