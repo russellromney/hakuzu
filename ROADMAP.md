@@ -1,110 +1,195 @@
 # hakuzu Roadmap
 
-## Phase GraphRedline: Lease backend selection for `hakuzu serve`
+This is the *unshipped* work. See CHANGELOG.md for shipped phases.
+Order is by `> After:` adjacency, not top-to-bottom position.
 
-> After: Phase GraphFjord
+Highest-priority unblock right now: **Phase GraphRedline** — without it,
+`hakuzu serve` cannot run in any production-like environment (bails
+immediately because it has no way to pick a lease or storage backend
+from config).
 
-`HaKuzuBuilder::open()` requires `.lease_store(...)` (no default — silently
-picking S3LeaseStore was unsafe, since Tigris and most S3-compatible
-backends do not enforce atomic conditional PUTs and split-brain the
-lease). Library embedders inject the right store directly, but
-`hakuzu serve` (the standalone CLI) currently bails because the
-`[lease]` config section only carries timing knobs — no backend choice.
+---
 
-This phase wires up backend dispatch.
+## Phase GraphRedline: `hakuzu serve` backend config dispatch
 
-### a. Config schema
+> After: Phase GraphFjord (shipped)
 
-- [ ] Add `[lease]` `backend` field to the SharedConfig CLI schema
-  (`hadb-cli`). Variants: `"nats-kv"`, `"cinch"`, `"s3"`, `"in-memory"`.
-- [ ] Backend-specific subsection (e.g. `[lease.nats] url = "..."`,
-  `[lease.cinch] endpoint = "..."`, `[lease.s3] bucket = "..."`). Reject
-  config that sets timing knobs but no backend.
+`HaKuzuBuilder::open()` now requires explicit `.lease_store(...)` and
+`.storage(...)` — silently picking S3LeaseStore was unsafe (Tigris does
+not enforce atomic conditional PUTs and split-brains the lease), and
+silently picking S3Storage hid which bucket / endpoint bytes landed in.
+Library embedders (cinch-engine) inject both directly and are
+unaffected. `hakuzu serve` currently fails at startup with a pointer
+to this phase, because the SharedConfig CLI schema has no way to
+express which backend to use.
 
-### b. Construction in `serve::resolve_lease_store`
+Close the gap.
+
+### a. CLI config schema
+
+- [ ] `[lease.backend]` field in `hadb-cli::SharedConfig::LeaseSection`.
+  Variants: `"nats-kv"`, `"cinch"`, `"s3"`, `"in-memory"`
+- [ ] `[storage.backend]` field in a new `StorageSection`. Variants:
+  `"s3"`, `"cinch"`
+- [ ] Backend-specific subsections (`[lease.nats] url = ...`,
+  `[lease.cinch] endpoint = ... admin_key = ...`,
+  `[lease.s3] bucket = ...`, `[storage.s3] bucket = ...
+  endpoint = ...`)
+- [ ] Reject config that sets timing knobs but no backend; reject
+  mismatched subsections (e.g. `backend = "nats-kv"` with a
+  `[lease.s3]` block present)
+
+### b. `serve::resolve_lease_store` dispatch
 
 - [ ] `nats-kv` → `hadb_lease_nats::NatsKvLeaseStore::new(...)`
-- [ ] `cinch` → `hadb_lease_cinch::CinchLeaseStore::new(...)` (use the
-  same admin-key auth path haqlite uses)
-- [ ] `s3` → `hadb_lease_s3::S3LeaseStore::new(...)` **only when the
-  endpoint is unset or explicitly tagged as AWS** — refuse otherwise
-  with the same Tigris-incompatible error
-- [ ] `in-memory` → `hadb::InMemoryLeaseStore::new()`, gated behind a
-  dev-mode flag so it can't accidentally ship to prod
+- [ ] `cinch` → `hadb_lease_cinch::CinchLeaseStore::new(...)` (same
+  admin-key auth path haqlite uses)
+- [ ] `s3` → `hadb_lease_s3::S3LeaseStore::new(...)` **only when
+  endpoint is unset (real AWS) or tagged with
+  `[lease.s3] allow_non_aws = true` (explicit opt-in).** Tigris,
+  MinIO, RustFS, R2 all error here.
+- [ ] `in-memory` → `hadb::InMemoryLeaseStore::new()`, gated behind
+  `[lease] dev_mode = true` so it can't accidentally ship to prod
 
-### c. Tests
+### c. `serve::resolve_storage` dispatch
 
-- [ ] Each backend variant: parse config → construct → bind to a
-  HaKuzu and run a one-node smoke
-- [ ] Reject config: `s3` + custom endpoint → loud error with the
-  Tigris-incompatibility note
-- [ ] Reject config: timing knobs without a backend → error
+- [ ] `s3` → `hadb_storage_s3::S3Storage::new(...)` — reads bucket,
+  endpoint, credentials from standard AWS env (`AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL`). This is what points at
+  a local RustFS in tests.
+- [ ] `cinch` → `hadb_storage_cinch::CinchHttpStorage::new(...)`
 
-### d. Documentation
+### d. Tests — use RustFS running locally, not mocks
 
-- [ ] README.md: `[lease]` config block reference, with a callout that
-  `s3` is AWS-only and Tigris/MinIO/RustFS users must pick `nats-kv`
-- [ ] Migration note: pre-Phase-GraphFjord users who relied on the
-  silent S3 default need to add `[lease] backend = "s3"` (AWS) or
-  switch to a safe backend
+- [ ] Stand up RustFS + NATS locally (see `cinch-rustfs.internal:9000`
+  pattern from the main cinch stack). Point `AWS_ENDPOINT_URL` at
+  RustFS and run the `--ignored` e2e tests already in the repo
+  (`tests/e2e.rs`) as part of the suite. Un-ignore them behind a feature
+  or env check.
+- [ ] Wire each backend variant through a one-node smoke that parses
+  config → `resolve_*` → open → write → read
+- [ ] Two-node smoke with `nats-kv` leases: leader claims, follower
+  replays, kill leader, follower promotes
+- [ ] Reject config: `backend = "s3"` + non-AWS endpoint without
+  `allow_non_aws = true` → loud error mentioning Tigris
+- [ ] Reject config: `backend = "in-memory"` without `dev_mode = true`
+  → loud error
 
----
+### e. e2e_ha.sh gate
 
-## Phase GraphFjord: Track hadb 0.4 final form
+- [ ] `tests/e2e_ha.sh` (591 lines, never run in this session) exercises
+  release binaries + real object storage + kill-process failover +
+  writer-reconnect. Point it at the local RustFS + NATS stack and
+  confirm all 7 scenarios pass. This is the closest thing to a
+  production smoke test.
 
-> After: Phase GraphParity
+### f. Documentation
 
-hadb shipped Phase Anvil i + Phase Fjord + Phase Driftwood + Phase Shoal,
-which finalized the lease/coordinator wiring. hakuzu still calls the old
-APIs and no longer compiles against hadb 0.4. This phase mirrors haqlite's
-matching adapt — see haqlite commits `00eaaeb` (Fjord), `8a418d7`
-(Driftwood timing-knob fix), and `5de12dd` (Driftwood HaNode re-export
-drop). hakuzu does not host its own SQLite-style page-storage adapter, so
-it does **not** need an `AtomicFence` wiring (the journal/manifest path
-gets ordering from CAS at the manifest level — see CLAUDE.md
-"Architecture Invariants").
-
-### a. LeaseConfig owns the store
-
-- [ ] `LeaseConfig::new` is now `(Arc<dyn LeaseStore>, instance_id, address)` — pass the lease store at construction
-- [ ] `Coordinator::new` drops the separate `Option<Arc<dyn LeaseStore>>` positional (now in `config.lease`); 7 args → 6 args
-- [ ] Update `src/builder.rs`, `src/serve.rs`, `src/bin/ha_experiment.rs`, and every `tests/*.rs` call site
-
-### b. Builder preserves caller-provided LeaseConfig timing
-
-- [ ] Stop overwriting `config.lease` unconditionally. Mirror haqlite `src/database.rs` line 440-463: take the existing LeaseConfig if any, patch in store/id/address; only build a fresh one when the caller didn't supply one
-- [ ] Forward CLI lease timing knobs (ttl_secs, renew_interval, follower_poll_interval) to the resolved LeaseConfig when set
-
-### c. Version bump + clean re-export of LeaseData
-
-- [ ] `Cargo.toml`: hakuzu 0.3.0 → 0.4.0
-- [ ] `src/lib.rs`: confirm `LeaseData` re-export points at the canonical hadb-lease shape (Phase Shoal). It is already re-exported via `hadb`; nothing else to do unless we expose it under our own module path
-
-### d. Tests must continue to verify HA semantics
-
-- [ ] Migrate test helpers in tests/thermopylae.rs, tests/rubicon.rs, tests/ha_database.rs to the new construction APIs
-- [ ] `cargo test --workspace` green, including the chaos tests in `thermopylae.rs` (kill-leader, rapid restart, concurrent writers, handoff under load) — these tests must continue to exercise the real lease/coordinator behavior, not stub it out
+- [ ] README: new `[lease]` / `[storage]` config block reference with
+  a callout that `s3` is AWS-only by default and Tigris / MinIO /
+  RustFS deployments need `allow_non_aws = true` (storage only — never
+  valid for leases)
+- [ ] "How to run locally" section documenting the RustFS + NATS local
+  test harness
 
 ---
 
-## Phase Rubicon: cinch-cloud Integration (Dedicated+Replicated)
+## Phase GraphGuardrail: Fence tokens on journal segment writes
 
-First milestone. Graph databases in cinch-cloud get basic HA with journal replication to S3, leader/follower failover, and write forwarding.
+> After: Phase GraphRedline
+
+**Open design question.** `graphstream`'s uploader calls
+`storage.put(key, bytes)` with no fence token. If two engines believe
+they're the leader for the same scope (Fly network partition during
+lease handoff) both can `put()` journal segments to the same S3
+prefix. The manifest-level CAS eventually catches it, but not before
+bytes land.
+
+haqlite solves the analogous SQLite page-write problem with an
+`AtomicFence` wired into `CinchHttpStorage`; every page PUT carries a
+`Fence-Token` header that the server rejects when the token is stale.
+For hakuzu the question is:
+
+- Should journal segment PUTs be fenced at the storage adapter layer
+  (like haqlite's pages), or is manifest-level CAS sufficient because
+  segments are append-only and sequence-numbered?
+- If the answer is "fence them": does the fence sit at graphstream's
+  uploader (pass a `FenceSource` into `spawn_journal_uploader`) or at
+  the `CinchHttpStorage` adapter (same as haqlite)?
+
+### Tasks
+
+- [ ] Write up the threat model: what exactly goes wrong if a stale
+  leader's segment PUT lands after the new leader's first manifest
+  publish? Is the manifest CAS sufficient to make the stale segment
+  inert, or does it poison recovery?
+- [ ] Decide: fence at uploader, fence at storage adapter, or no
+  fence (manifest CAS is enough)
+- [ ] If fencing is needed: thread a `FenceSource` through the
+  hakuzu → graphstream → storage layer. haqlite's wiring is the
+  reference
+- [ ] Test: a synthetic "stale leader holds segment PUT while new
+  leader takes over" scenario, assert the stale segment either fails
+  to land or is recoverably ignored
+
+---
+
+## Phase GraphManifestWakeup: Fix dead manifest-changed wakeup in Synchronous mode
+
+> After: Phase GraphRedline (low priority until Synchronous mode ships)
+
+Latent bug, pre-existing, flagged during the GraphFjord review.
+`src/builder.rs` creates a `manifest_wakeup: Arc<tokio::sync::Notify>`
+in Synchronous mode and wires it into `TurbographFollowerBehavior`,
+but passes `None` for `Coordinator::new`'s `manifest_store` arg.
+Without a `ManifestStore`, the lease monitor never emits
+`ManifestChanged` events, so the `Notify` is never triggered and
+followers fall back to polling on the full `follower_pull_interval`
+instead of waking on manifest change.
+
+Not a correctness issue in Dedicated+Replicated (the only mode that
+ships today). Becomes a footgun the moment anyone enables
+Synchronous.
+
+### Tasks
+
+- [ ] Pass `self.manifest_store` into `Coordinator::new` instead of
+  `None`, so the lease monitor's manifest poller can fire
+  ManifestChanged into `self.role_tx`
+- [ ] Verify the existing
+  `manifest_changed_wakeup_triggers_correctly` test in
+  `tests/graph_meridian.rs` actually ends-to-end: event emitted →
+  listener calls `notify.notify_one()` → follower wakes. Add a
+  follower-loop assertion if the current test only covers the notify
+  mechanics
+- [ ] Delete the `manifest_wakeup` field from
+  `TurbographFollowerBehavior` if the role-event path + Coordinator
+  wakeup covers it end-to-end (haqlite's Phase Lucid pattern)
+
+---
+
+## Phase Rubicon: External engine support for cinch-cloud
+
+> After: Phase GraphRedline
+
+Partial. `.lease_store()` and `.storage()` paths shipped in Phase
+GraphFjord. Remaining: external lbug::Database + engine wiring so
+cinch-engine can own the database lifecycle and hand hakuzu a
+ready-to-use handle.
 
 ### a. Builder API for external engine
-- [ ] `HaKuzuBuilder::engine(Arc<graphd_engine::Engine>)`: accept an externally-created engine instead of opening a new `lbug::Database`
-- [ ] When set, hakuzu uses this engine for query execution + journal writing
-- [ ] cinch-cloud creates `graphd_engine::Engine` (with sandbox, FTS, connection pool), passes to hakuzu for HA wrapping
+- [ ] `HaKuzuBuilder::engine(Arc<graphd_engine::Engine>)`: accept an
+  externally-created engine instead of opening a new `lbug::Database`
+- [ ] When set, hakuzu uses this engine for query execution + journal
+  writing
+- [ ] cinch-cloud creates `graphd_engine::Engine` (with sandbox, FTS,
+  connection pool), passes to hakuzu for HA wrapping
 
-### b. Pluggable LeaseStore
-- [ ] `HaKuzuBuilder::lease_store(Arc<dyn LeaseStore>)`: skip S3LeaseStore construction, use any custom store (NATS, Redis, etcd)
-- [ ] Same pattern as haqlite Phase Volt-c
-- [ ] Enables NATS leases from cinch-cloud's shared lease infrastructure
-
-### c. Tests
-- [ ] Two-node HA with external engine: leader writes, follower replays, failover works
-- [ ] Custom lease store (in-memory) used correctly
-- [ ] External engine lifecycle: hakuzu.close() drains journal and seals segment
+### b. Tests
+- [ ] Two-node HA with external engine: leader writes, follower
+  replays, failover works
+- [ ] External engine lifecycle: `hakuzu.close()` drains journal and
+  seals segment
 
 ---
 

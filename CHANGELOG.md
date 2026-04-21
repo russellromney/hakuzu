@@ -1,5 +1,40 @@
 # hakuzu Changelog
 
+## Phase GraphFjord: Track hadb 0.4 final form + no silent fallbacks
+
+> After: Phase GraphForge
+
+Adapts hakuzu to the finalized hadb 0.4 lease/coordinator wiring
+(hadb Phase Anvil i / Fjord / Driftwood / Shoal) and tightens the
+builder contract so the caller explicitly picks every backend with
+safety implications.
+
+API shape now matches haqlite's:
+
+- `LeaseConfig::new(store, instance_id, address)` — 3 args, store
+  owned by the config (hadb Phase Fjord).
+- `Coordinator::new` 6 args (lease store moved into `config.lease`).
+- Builder preserves caller-provided LeaseConfig timing instead of
+  overwriting it (mirrors haqlite Phase Driftwood fix).
+- New `.lease_ttl()` / `.lease_renew_interval()` /
+  `.lease_follower_poll_interval()` setters; `serve.rs` routes CLI
+  timing knobs through them (no placeholder lease store).
+- `MockObjectStore` test fixture reimplemented on
+  `hadb_storage::StorageBackend`.
+
+Safety gate: `HaKuzuBuilder::open()` errors when `.lease_store()` or
+`.storage()` is missing. Leader election CAS atomicity and storage
+placement are both caller decisions — hakuzu no longer silently
+builds an `S3LeaseStore` / `S3Storage`, because Tigris and most
+S3-compatible backends do not enforce atomic conditional PUTs and
+split-brain the lease. `bucket` constructor arg and `.endpoint()`
+setter removed (dead after default removal). Two new regression
+tests cover the gates.
+
+`hakuzu serve` bails via `serve::resolve_lease_store` /
+`serve::resolve_storage` until Phase GraphRedline wires up a
+config-driven dispatcher. 277 hakuzu tests green at ship.
+
 ## Phase GraphForge: hadb-storage Trait Migration
 
 > After: Phase Cascade . Before: Phase GraphCinch (cinch-cloud)
