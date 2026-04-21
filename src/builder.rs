@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use hadb::{Coordinator, CoordinatorConfig, LeaseConfig};
-use hadb_lease_s3::S3LeaseStore;
 use hadb_storage::StorageBackend;
 
 use crate::database::{HaKuzu, SnapshotConfig, open_database, open_with_coordinator};
@@ -25,10 +24,13 @@ const DEFAULT_SNAPSHOT_EVERY_N_ENTRIES: u64 = 10_000;
 pub(crate) const DEFAULT_READ_CONCURRENCY: usize = 8;
 
 /// Builder for creating an HA Kuzu instance.
+///
+/// The caller is responsible for supplying both trust-rooted dependencies
+/// via [`Self::lease_store`] and [`Self::storage`] — hakuzu will not pick
+/// an S3 bucket / endpoint for you. See the setter doc comments for
+/// guidance on which backend fits which deployment.
 pub struct HaKuzuBuilder {
-    bucket: String,
     prefix: String,
-    endpoint: Option<String>,
     instance_id: Option<String>,
     address: Option<String>,
     forwarding_port: u16,
@@ -40,23 +42,23 @@ pub struct HaKuzuBuilder {
     snapshot_every_n_entries: Option<u64>,
     read_concurrency: usize,
     custom_lease_store: Option<Arc<dyn hadb::LeaseStore>>,
-    /// External storage backend. When `Some`, hakuzu uses this for both
-    /// journal segment upload/pull AND snapshot upload/download. When `None`,
-    /// a default S3Storage is constructed from `bucket`/`endpoint`.
     custom_storage: Option<Arc<dyn StorageBackend>>,
     external_db: Option<Arc<lbug::Database>>,
     external_locks: Option<(Arc<tokio::sync::Mutex<()>>, Arc<std::sync::RwLock<()>>)>,
     ha_mode: HaMode,
     durability: Durability,
     manifest_store: Option<Arc<dyn hadb::ManifestStore>>,
+    // Lease timing knobs. `None` means "use the LeaseConfig default, or
+    // whatever the caller put in `coordinator_config`."
+    lease_ttl: Option<u64>,
+    lease_renew_interval: Option<Duration>,
+    lease_follower_poll_interval: Option<Duration>,
 }
 
 impl HaKuzuBuilder {
-    pub(crate) fn new(bucket: &str) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            bucket: bucket.to_string(),
             prefix: DEFAULT_PREFIX.to_string(),
-            endpoint: None,
             instance_id: None,
             address: None,
             forwarding_port: DEFAULT_FORWARDING_PORT,
@@ -74,28 +76,58 @@ impl HaKuzuBuilder {
             ha_mode: HaMode::default(),
             durability: Durability::default(),
             manifest_store: None,
+            lease_ttl: None,
+            lease_renew_interval: None,
+            lease_follower_poll_interval: None,
         }
     }
 
-    /// Provide an explicit [`StorageBackend`] implementation for journal
-    /// segment and snapshot I/O. Embedders that want to drive hakuzu through
-    /// Cinch HTTP (the default wire protocol in cinch-cloud) construct a
-    /// `CinchHttpStorage` and pass it here. If omitted, hakuzu builds an
-    /// `S3Storage` from `bucket` / `endpoint`.
+    /// Lease TTL in seconds. Overrides whatever `coordinator_config.lease`
+    /// carried. Default: `LeaseConfig::new`'s default (5s).
+    pub fn lease_ttl(mut self, ttl_secs: u64) -> Self {
+        self.lease_ttl = Some(ttl_secs);
+        self
+    }
+
+    /// How often the Leader renews its lease. Default: 2s.
+    pub fn lease_renew_interval(mut self, interval: Duration) -> Self {
+        self.lease_renew_interval = Some(interval);
+        self
+    }
+
+    /// How often a Follower polls the lease looking for Leader death.
+    /// Default: 1s.
+    pub fn lease_follower_poll_interval(mut self, interval: Duration) -> Self {
+        self.lease_follower_poll_interval = Some(interval);
+        self
+    }
+
+    /// Configure the [`StorageBackend`] used for journal segment and
+    /// snapshot I/O.
+    ///
+    /// Required. `HaKuzuBuilder::open()` returns an error when this is not
+    /// set — hakuzu won't silently build an `S3Storage` for you. Pick the
+    /// backend that fits your deployment:
+    ///
+    /// - `hadb_storage_s3::S3Storage` — AWS, Tigris, MinIO, RustFS, R2,
+    ///   Wasabi, or any other S3-compatible service. Caller supplies
+    ///   bucket, credentials, and optional endpoint via an
+    ///   `aws_sdk_s3::Client`.
+    /// - `hadb_storage_cinch::CinchHttpStorage` — cinch-hosted deployments
+    ///   (fence-token-gated writes).
+    /// - Any other `StorageBackend` impl — in-process mocks for tests, etc.
+    ///
+    /// Tests pointing at a local RustFS pass standard AWS env vars
+    /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL`)
+    /// when they build the `S3Storage` — hakuzu doesn't need to know.
     pub fn storage(mut self, storage: Arc<dyn StorageBackend>) -> Self {
         self.custom_storage = Some(storage);
         self
     }
 
-    /// S3 key prefix for all hakuzu data. Default: "hakuzu/".
+    /// Storage key prefix for all hakuzu data. Default: "hakuzu/".
     pub fn prefix(mut self, prefix: &str) -> Self {
         self.prefix = prefix.to_string();
-        self
-    }
-
-    /// S3 endpoint URL (for Tigris, MinIO, R2, etc).
-    pub fn endpoint(mut self, endpoint: &str) -> Self {
-        self.endpoint = Some(endpoint.to_string());
         self
     }
 
@@ -162,10 +194,19 @@ impl HaKuzuBuilder {
         self
     }
 
-    /// Use a custom LeaseStore instead of the default S3LeaseStore.
+    /// Configure the [`hadb::LeaseStore`] used for leader election.
     ///
-    /// Works with any `LeaseStore` implementation: NATS, Redis, in-memory, etc.
-    /// When set, the builder skips S3LeaseStore construction in `open()`.
+    /// Required. `HaKuzuBuilder::open()` returns an error when this is not
+    /// set — leader election semantics depend on the CAS atomicity of the
+    /// backend, which hakuzu won't pick for you. Supported choices:
+    ///
+    /// - `hadb_lease_cinch::CinchLeaseStore` — cinch-hosted deployments
+    ///   (NATS KV behind the grabby API).
+    /// - `hadb_lease_nats::NatsKvLeaseStore` — self-hosted against Tigris,
+    ///   MinIO, RustFS, or any other object store without atomic CAS.
+    /// - `hadb_lease_s3::S3LeaseStore` — AWS S3 only. **Not safe on Tigris**
+    ///   (atomic conditional PUTs are not enforced for concurrent writes).
+    /// - `hadb::InMemoryLeaseStore` — in-process tests only.
     pub fn lease_store(mut self, store: Arc<dyn hadb::LeaseStore>) -> Self {
         self.custom_lease_store = Some(store);
         self
@@ -254,6 +295,32 @@ impl HaKuzuBuilder {
             ));
         }
 
+        // No silent fallbacks for the two trust-rooted dependencies. Lease
+        // store CAS atomicity controls leader election safety; storage
+        // backend choice controls where bytes land. hakuzu won't pick
+        // either for you. See `.lease_store()` / `.storage()` doc comments
+        // for the supported choices.
+        if self.custom_lease_store.is_none() {
+            return Err(anyhow!(
+                "HaKuzuBuilder requires an explicit lease store via .lease_store(...). \
+                 Leader election semantics depend on the CAS atomicity of the backend, \
+                 which hakuzu cannot pick for you. Supported choices: \
+                 hadb_lease_cinch::CinchLeaseStore (cinch-hosted), \
+                 hadb_lease_nats::NatsKvLeaseStore (self-hosted Tigris/MinIO/RustFS), \
+                 hadb_lease_s3::S3LeaseStore (AWS S3 only — NOT safe on Tigris), \
+                 or hadb::InMemoryLeaseStore (in-process tests only)."
+            ));
+        }
+        if self.custom_storage.is_none() {
+            return Err(anyhow!(
+                "HaKuzuBuilder requires an explicit storage backend via .storage(...). \
+                 hakuzu won't silently build an S3Storage from `bucket`/`endpoint`. \
+                 Supported choices: hadb_storage_s3::S3Storage (AWS / RustFS / MinIO / \
+                 Tigris — caller picks bucket + creds), hadb_storage_cinch::CinchHttpStorage \
+                 (cinch-hosted, fenced), or any other StorageBackend impl."
+            ));
+        }
+
         let db_path = PathBuf::from(db_path);
         let db_name = db_path
             .file_name()
@@ -269,33 +336,11 @@ impl HaKuzuBuilder {
             detect_address(&instance_id, self.forwarding_port)
         });
 
-        // Resolve the StorageBackend. If the caller handed us one via
-        // `.storage()` (the cinch-engine path: CinchHttpStorage with a
-        // FenceSource), use it. Otherwise build an S3Storage from
-        // bucket/endpoint.
-        let storage: Arc<dyn StorageBackend> = match self.custom_storage {
-            Some(storage) => storage,
-            None => {
-                let s3_config = match &self.endpoint {
-                    Some(endpoint) => {
-                        aws_config::defaults(aws_config::BehaviorVersion::latest())
-                            .endpoint_url(endpoint)
-                            .load()
-                            .await
-                    }
-                    None => {
-                        aws_config::defaults(aws_config::BehaviorVersion::latest())
-                            .load()
-                            .await
-                    }
-                };
-                let s3_client = aws_sdk_s3::Client::new(&s3_config);
-                Arc::new(hadb_storage_s3::S3Storage::new(
-                    s3_client,
-                    self.bucket.clone(),
-                ))
-            }
-        };
+        // Storage is caller-provided (validated above — the `None` arm is
+        // unreachable here).
+        let storage: Arc<dyn StorageBackend> = self
+            .custom_storage
+            .expect("storage validated above");
 
         // Snapshot bootstrap: skip when using an external database (caller
         // is responsible for the database state).
@@ -355,29 +400,10 @@ impl HaKuzuBuilder {
             }
         }
 
-        // Resolve lease store: explicit custom store, or build S3LeaseStore
-        // against a freshly-constructed S3 client. The Cinch path provides
-        // its own lease store (CinchHttpLeaseStore) via .lease_store().
-        let lease_store: Arc<dyn hadb::LeaseStore> = match self.custom_lease_store {
-            Some(store) => store,
-            None => {
-                let s3_config = match &self.endpoint {
-                    Some(endpoint) => {
-                        aws_config::defaults(aws_config::BehaviorVersion::latest())
-                            .endpoint_url(endpoint)
-                            .load()
-                            .await
-                    }
-                    None => {
-                        aws_config::defaults(aws_config::BehaviorVersion::latest())
-                            .load()
-                            .await
-                    }
-                };
-                let s3_client = aws_sdk_s3::Client::new(&s3_config);
-                Arc::new(S3LeaseStore::new(s3_client, self.bucket.clone()))
-            }
-        };
+        // Lease store is caller-provided (validated above).
+        let lease_store: Arc<dyn hadb::LeaseStore> = self
+            .custom_lease_store
+            .expect("lease_store validated above");
 
         // Open database: use external database if provided, otherwise open locally.
         // NOTE: database must be opened before TurbographReplicator (needs Arc<lbug::Database>).
@@ -468,14 +494,40 @@ impl HaKuzuBuilder {
             Durability::Eventual => unreachable!("rejected above"),
         };
 
-        // Build coordinator.
+        // Build coordinator. The lease store lives inside `LeaseConfig`
+        // (hadb Phase Fjord) — store + policy travel together. If the caller
+        // passed a `coordinator_config` with a pre-built `lease`, preserve
+        // its timing policy but patch in the real wiring (store, instance_id,
+        // address). Explicit builder timing setters override both defaults
+        // and caller-supplied timing. Mirrors haqlite `src/database.rs`.
         let mut config = self.coordinator_config.unwrap_or_default();
-        config.lease = Some(LeaseConfig::new(instance_id.clone(), address.clone()));
+        let mut lease_cfg = match config.lease.take() {
+            Some(mut existing) => {
+                existing.store = lease_store.clone();
+                existing.instance_id = instance_id.clone();
+                existing.address = address.clone();
+                existing
+            }
+            None => LeaseConfig::new(
+                lease_store.clone(),
+                instance_id.clone(),
+                address.clone(),
+            ),
+        };
+        if let Some(ttl) = self.lease_ttl {
+            lease_cfg.ttl_secs = ttl;
+        }
+        if let Some(d) = self.lease_renew_interval {
+            lease_cfg.renew_interval = d;
+        }
+        if let Some(d) = self.lease_follower_poll_interval {
+            lease_cfg.follower_poll_interval = d;
+        }
+        config.lease = Some(lease_cfg);
 
         let coordinator = Coordinator::new(
             replicator.clone(),
-            Some(lease_store),
-            None,
+            None, // manifest_store: TurbographFollowerBehavior owns its own manifest polling
             None, // node_registry
             follower_behavior,
             &self.prefix,

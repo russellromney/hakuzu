@@ -1,14 +1,22 @@
-//! hakuzu — HA Kuzu/LadybugDB with one line of code.
+//! hakuzu — HA Kuzu/LadybugDB.
 //!
-//! Leader election, journal replication, write forwarding — just your app + an S3 bucket.
+//! Leader election, journal replication, write forwarding. Caller supplies
+//! both the storage backend (S3-compatible — AWS, Tigris, MinIO, RustFS —
+//! or cinch HTTP) and the lease store (NATS KV for self-hosted, cinch HTTP
+//! for cinch-hosted, S3 only on real AWS). hakuzu does not pick either
+//! for you because the safety envelope depends on the choice.
 //!
-//! hakuzu is to Kuzu/graphd what haqlite is to SQLite — the HA layer that wraps
-//! graphstream's journal replication and hadb's coordination framework.
+//! hakuzu is to Kuzu/graphd what haqlite is to SQLite — the HA layer that
+//! wraps graphstream's journal replication and hadb's coordination
+//! framework.
 //!
 //! ```ignore
+//! use std::sync::Arc;
 //! use hakuzu::{HaKuzu, QueryResult};
 //!
-//! let db = HaKuzu::builder("my-bucket")
+//! let db = HaKuzu::builder()
+//!     .storage(Arc::new(hadb_storage_s3::S3Storage::new(s3_client, "my-bucket".into())))
+//!     .lease_store(Arc::new(hadb_lease_nats::NatsKvLeaseStore::new(nats_url).await?))
 //!     .open("/data/graph", "CREATE NODE TABLE IF NOT EXISTS Person(id INT64, name STRING, PRIMARY KEY(id))")
 //!     .await?;
 //!

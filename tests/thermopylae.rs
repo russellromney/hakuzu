@@ -35,6 +35,7 @@ fn build_coordinator(
 ) -> (Arc<Coordinator>, Arc<KuzuReplicator>) {
     let config = CoordinatorConfig {
         lease: Some(LeaseConfig::new(
+            lease_store,
             instance_id.to_string(),
             address.to_string(),
         )),
@@ -49,9 +50,8 @@ fn build_coordinator(
 
     let coordinator = Coordinator::new(
         replicator.clone(),
-        Some(lease_store),
-        None,
-        None,
+        None, // manifest_store
+        None, // node_registry
         follower_behavior,
         "test/",
         config,

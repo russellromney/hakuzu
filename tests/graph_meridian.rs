@@ -172,14 +172,14 @@ fn get_manifest_version_without_extension_returns_clear_error() {
 #[test]
 fn builder_accepts_mode_and_durability() {
     // Just verify these builder methods compile and chain correctly.
-    let _builder = hakuzu::HaKuzu::builder("test-bucket")
+    let _builder = hakuzu::HaKuzu::builder()
         .mode(HaMode::Dedicated)
         .durability(Durability::Replicated);
 }
 
 #[test]
 fn builder_accepts_synchronous_durability() {
-    let _builder = hakuzu::HaKuzu::builder("test-bucket")
+    let _builder = hakuzu::HaKuzu::builder()
         .mode(HaMode::Dedicated)
         .durability(Durability::Synchronous);
 }
@@ -187,7 +187,7 @@ fn builder_accepts_synchronous_durability() {
 #[test]
 fn builder_accepts_manifest_store() {
     let store = Arc::new(hadb::InMemoryManifestStore::new());
-    let _builder = hakuzu::HaKuzu::builder("test-bucket")
+    let _builder = hakuzu::HaKuzu::builder()
         .mode(HaMode::Dedicated)
         .durability(Durability::Synchronous)
         .manifest_store(store);
@@ -228,7 +228,7 @@ fn reexports_accessible() {
 /// This check happens before S3 config load (fast fail, no network access).
 #[tokio::test]
 async fn synchronous_durability_requires_manifest_store() {
-    let result = hakuzu::HaKuzu::builder("test-bucket")
+    let result = hakuzu::HaKuzu::builder()
         .durability(Durability::Synchronous)
         .open("/tmp/nonexistent_test_db", "")
         .await;
@@ -310,7 +310,7 @@ async fn manifest_changed_wakeup_triggers_correctly() {
 #[test]
 fn replicated_mode_does_not_require_manifest_store() {
     // Just building, not opening (no S3 access needed to verify builder state).
-    let _b = hakuzu::HaKuzu::builder("bucket")
+    let _b = hakuzu::HaKuzu::builder()
         .durability(Durability::Replicated);
     // If this compiles and doesn't panic, the test passes.
 }

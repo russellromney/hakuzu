@@ -13,7 +13,7 @@ use axum::routing::{get, post};
 use axum::Json;
 use tracing::{error, info};
 
-use hadb::{CoordinatorConfig, LeaseConfig, Role};
+use hadb::{CoordinatorConfig, Role};
 use hadb_cli::SharedConfig;
 
 use crate::cli_config::ServeConfig;
@@ -36,11 +36,50 @@ pub fn build_router(state: Arc<AppState>) -> axum::Router {
         .with_state(state)
 }
 
+/// Resolve the lease store for `hakuzu serve`.
+///
+/// Today: returns `Err` unconditionally. Leader election semantics depend on
+/// the CAS atomicity of the backend (`S3LeaseStore` is only atomic on real
+/// AWS S3; Tigris, MinIO, RustFS, and most S3-compatible services split
+/// concurrent conditional PUTs and permit split-brain leases). The CLI has
+/// no way to pick safely from config today.
+///
+/// When the CLI grows a `[lease.backend]` config field that dispatches to
+/// `hadb-lease-nats` / `hadb-lease-cinch` / `hadb-lease-s3`, the
+/// construction goes here. See ROADMAP.md Phase GraphRedline.
+fn resolve_lease_store(_shared: &SharedConfig) -> Result<Arc<dyn hadb::LeaseStore>> {
+    Err(anyhow!(
+        "`hakuzu serve` does not yet support standalone lease-backend selection. \
+         Embed hakuzu as a library and inject a lease store via \
+         HaKuzuBuilder::lease_store(...) — or wire a `[lease.backend]` dispatch \
+         into serve::resolve_lease_store (see ROADMAP.md Phase GraphRedline)."
+    ))
+}
+
+/// Resolve the storage backend for `hakuzu serve`.
+///
+/// Today: returns `Err`. The CLI has no `[storage]` dispatch, same
+/// situation as lease. Tests and library embedders pass an explicit
+/// `hadb_storage_s3::S3Storage` (AWS/Tigris/MinIO/RustFS — all via AWS env
+/// vars), or `hadb_storage_cinch::CinchHttpStorage` for cinch-hosted.
+/// Wiring a config-driven dispatcher here is part of Phase GraphRedline.
+fn resolve_storage(_shared: &SharedConfig) -> Result<Arc<dyn hadb_storage::StorageBackend>> {
+    Err(anyhow!(
+        "`hakuzu serve` does not yet support standalone storage-backend selection. \
+         Embed hakuzu as a library and inject storage via HaKuzuBuilder::storage(...) — \
+         or wire a `[storage.backend]` dispatch into serve::resolve_storage \
+         (see ROADMAP.md Phase GraphRedline)."
+    ))
+}
+
 /// Run the hakuzu serve command.
 pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
     if shared.s3.bucket.is_empty() {
         anyhow::bail!("S3 bucket is required (set [s3] bucket in config or HADB_BUCKET env var)");
     }
+
+    let lease_store = resolve_lease_store(shared)?;
+    let storage = resolve_storage(shared)?;
 
     let db_path = &serve.db_path;
     let schema = serve.schema.as_deref().unwrap_or("");
@@ -51,15 +90,9 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
 
     let address = format!("http://0.0.0.0:{}", serve.forwarding_port);
 
-    let mut lease_config = LeaseConfig::new(instance_id.clone(), address.clone());
-    lease_config.ttl_secs = shared.lease.ttl_secs;
-    lease_config.renew_interval = shared.lease.renew_interval();
-    lease_config.follower_poll_interval = shared.lease.poll_interval();
-
     let coordinator_config = CoordinatorConfig {
         sync_interval: Duration::from_millis(serve.sync_interval_ms),
         follower_pull_interval: Duration::from_millis(serve.follower_pull_ms),
-        lease: Some(lease_config),
         ..Default::default()
     };
 
@@ -88,18 +121,20 @@ pub async fn run(shared: &SharedConfig, serve: &ServeConfig) -> Result<()> {
     };
 
     // Build HaKuzu.
-    let mut builder = HaKuzu::builder(&shared.s3.bucket)
+    let mut builder = HaKuzu::builder()
         .mode(ha_mode)
         .durability(durability)
         .prefix(&serve.prefix)
         .forwarding_port(serve.forwarding_port)
         .instance_id(&instance_id)
         .address(&address)
+        .storage(storage)
+        .lease_store(lease_store)
+        .lease_ttl(shared.lease.ttl_secs)
+        .lease_renew_interval(shared.lease.renew_interval())
+        .lease_follower_poll_interval(shared.lease.poll_interval())
         .coordinator_config(coordinator_config);
 
-    if let Some(ref endpoint) = shared.s3.endpoint {
-        builder = builder.endpoint(endpoint);
-    }
     if let Some(ref secret) = serve.secret {
         builder = builder.secret(secret);
     }

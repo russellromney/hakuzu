@@ -62,8 +62,8 @@ let db = HaKuzu::local("/data/graph", "CREATE NODE TABLE IF NOT EXISTS ...")?;
 ## Dependencies
 
 - [hadb](https://github.com/russellromney/hadb) -- HA coordination (leader election, follower readiness, pluggable LeaseStore)
-- [hadb-io](https://github.com/russellromney/hadb/tree/main/hadb-io) -- ObjectStore trait, S3 backend, retry, circuit breaker
-- [graphstream](https://github.com/russellromney/graphstream) -- Journal replication via ObjectStore (hadb-io migration complete)
+- [hadb-storage](https://github.com/russellromney/hadb/tree/main/hadb-storage) -- byte-level `StorageBackend` trait. hakuzu picks `hadb-storage-s3` by default; embedders can inject any impl via `.storage(...)` (e.g. cinch's `CinchHttpStorage`)
+- [graphstream](https://github.com/russellromney/graphstream) -- Journal replication on `hadb-storage`
 - [lbug](https://github.com/Vela-Engineering/ladybug) -- Rust bindings for LadybugDB/Kuzu
 
 ### macOS: ladybug-fork required

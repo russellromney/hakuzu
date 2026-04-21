@@ -1,5 +1,92 @@
 # hakuzu Roadmap
 
+## Phase GraphRedline: Lease backend selection for `hakuzu serve`
+
+> After: Phase GraphFjord
+
+`HaKuzuBuilder::open()` requires `.lease_store(...)` (no default — silently
+picking S3LeaseStore was unsafe, since Tigris and most S3-compatible
+backends do not enforce atomic conditional PUTs and split-brain the
+lease). Library embedders inject the right store directly, but
+`hakuzu serve` (the standalone CLI) currently bails because the
+`[lease]` config section only carries timing knobs — no backend choice.
+
+This phase wires up backend dispatch.
+
+### a. Config schema
+
+- [ ] Add `[lease]` `backend` field to the SharedConfig CLI schema
+  (`hadb-cli`). Variants: `"nats-kv"`, `"cinch"`, `"s3"`, `"in-memory"`.
+- [ ] Backend-specific subsection (e.g. `[lease.nats] url = "..."`,
+  `[lease.cinch] endpoint = "..."`, `[lease.s3] bucket = "..."`). Reject
+  config that sets timing knobs but no backend.
+
+### b. Construction in `serve::resolve_lease_store`
+
+- [ ] `nats-kv` → `hadb_lease_nats::NatsKvLeaseStore::new(...)`
+- [ ] `cinch` → `hadb_lease_cinch::CinchLeaseStore::new(...)` (use the
+  same admin-key auth path haqlite uses)
+- [ ] `s3` → `hadb_lease_s3::S3LeaseStore::new(...)` **only when the
+  endpoint is unset or explicitly tagged as AWS** — refuse otherwise
+  with the same Tigris-incompatible error
+- [ ] `in-memory` → `hadb::InMemoryLeaseStore::new()`, gated behind a
+  dev-mode flag so it can't accidentally ship to prod
+
+### c. Tests
+
+- [ ] Each backend variant: parse config → construct → bind to a
+  HaKuzu and run a one-node smoke
+- [ ] Reject config: `s3` + custom endpoint → loud error with the
+  Tigris-incompatibility note
+- [ ] Reject config: timing knobs without a backend → error
+
+### d. Documentation
+
+- [ ] README.md: `[lease]` config block reference, with a callout that
+  `s3` is AWS-only and Tigris/MinIO/RustFS users must pick `nats-kv`
+- [ ] Migration note: pre-Phase-GraphFjord users who relied on the
+  silent S3 default need to add `[lease] backend = "s3"` (AWS) or
+  switch to a safe backend
+
+---
+
+## Phase GraphFjord: Track hadb 0.4 final form
+
+> After: Phase GraphParity
+
+hadb shipped Phase Anvil i + Phase Fjord + Phase Driftwood + Phase Shoal,
+which finalized the lease/coordinator wiring. hakuzu still calls the old
+APIs and no longer compiles against hadb 0.4. This phase mirrors haqlite's
+matching adapt — see haqlite commits `00eaaeb` (Fjord), `8a418d7`
+(Driftwood timing-knob fix), and `5de12dd` (Driftwood HaNode re-export
+drop). hakuzu does not host its own SQLite-style page-storage adapter, so
+it does **not** need an `AtomicFence` wiring (the journal/manifest path
+gets ordering from CAS at the manifest level — see CLAUDE.md
+"Architecture Invariants").
+
+### a. LeaseConfig owns the store
+
+- [ ] `LeaseConfig::new` is now `(Arc<dyn LeaseStore>, instance_id, address)` — pass the lease store at construction
+- [ ] `Coordinator::new` drops the separate `Option<Arc<dyn LeaseStore>>` positional (now in `config.lease`); 7 args → 6 args
+- [ ] Update `src/builder.rs`, `src/serve.rs`, `src/bin/ha_experiment.rs`, and every `tests/*.rs` call site
+
+### b. Builder preserves caller-provided LeaseConfig timing
+
+- [ ] Stop overwriting `config.lease` unconditionally. Mirror haqlite `src/database.rs` line 440-463: take the existing LeaseConfig if any, patch in store/id/address; only build a fresh one when the caller didn't supply one
+- [ ] Forward CLI lease timing knobs (ttl_secs, renew_interval, follower_poll_interval) to the resolved LeaseConfig when set
+
+### c. Version bump + clean re-export of LeaseData
+
+- [ ] `Cargo.toml`: hakuzu 0.3.0 → 0.4.0
+- [ ] `src/lib.rs`: confirm `LeaseData` re-export points at the canonical hadb-lease shape (Phase Shoal). It is already re-exported via `hadb`; nothing else to do unless we expose it under our own module path
+
+### d. Tests must continue to verify HA semantics
+
+- [ ] Migrate test helpers in tests/thermopylae.rs, tests/rubicon.rs, tests/ha_database.rs to the new construction APIs
+- [ ] `cargo test --workspace` green, including the chaos tests in `thermopylae.rs` (kill-leader, rapid restart, concurrent writers, handoff under load) — these tests must continue to exercise the real lease/coordinator behavior, not stub it out
+
+---
+
 ## Phase Rubicon: cinch-cloud Integration (Dedicated+Replicated)
 
 First milestone. Graph databases in cinch-cloud get basic HA with journal replication to S3, leader/follower failover, and write forwarding.

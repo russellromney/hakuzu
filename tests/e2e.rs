@@ -11,18 +11,19 @@
 use graphstream::journal::{self, JournalCommand, JournalState, PendingEntry};
 use hadb_changeset::journal::{decode_header, HADBJ_MAGIC, HEADER_SIZE};
 use hadb_changeset::storage::{format_key, ChangesetKind, GENERATION_INCREMENTAL};
+use hadb_storage::StorageBackend;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Create S3 client + ObjectStore + bucket + unique prefix from env vars.
-async fn s3_setup() -> (aws_sdk_s3::Client, Arc<dyn hadb_io::ObjectStore>, String, String) {
+/// Create S3 client + StorageBackend + bucket + unique prefix from env vars.
+async fn s3_setup() -> (aws_sdk_s3::Client, Arc<dyn StorageBackend>, String, String) {
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let client = aws_sdk_s3::Client::new(&config);
     let bucket =
         std::env::var("S3_TEST_BUCKET").expect("S3_TEST_BUCKET env var required for e2e tests");
-    let object_store: Arc<dyn hadb_io::ObjectStore> = Arc::new(
-        hadb_io::S3Backend::new(client.clone(), bucket.clone()),
+    let object_store: Arc<dyn StorageBackend> = Arc::new(
+        hadb_storage_s3::S3Storage::new(client.clone(), bucket.clone()),
     );
     let prefix = format!("hakuzu-e2e-{}/", uuid::Uuid::new_v4());
     (client, object_store, bucket, prefix)

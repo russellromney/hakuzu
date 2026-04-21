@@ -29,7 +29,11 @@ fn build_coordinator(
     shared_db: Arc<lbug::Database>,
 ) -> (Arc<Coordinator>, Arc<KuzuReplicator>) {
     let config = CoordinatorConfig {
-        lease: Some(LeaseConfig::new(instance_id.to_string(), address.to_string())),
+        lease: Some(LeaseConfig::new(
+            lease_store,
+            instance_id.to_string(),
+            address.to_string(),
+        )),
         ..Default::default()
     };
 
@@ -45,8 +49,7 @@ fn build_coordinator(
 
     let coordinator = Coordinator::new(
         replicator.clone(),
-        Some(lease_store),
-        None,
+        None, // manifest_store
         None, // node_registry
         follower_behavior,
         "test/",
@@ -802,15 +805,18 @@ async fn forwarding_retry_exhausts_backoff() {
             address: "http://localhost:19061".into(),
             follower_poll_interval: Duration::from_secs(60),
             required_expired_reads: 1000,
-            ..LeaseConfig::new("retry-follower".into(), "http://localhost:19061".into())
+            ..LeaseConfig::new(
+                lease_store.clone(),
+                "retry-follower".into(),
+                "http://localhost:19061".into(),
+            )
         }),
         ..Default::default()
     };
     let coord2 = Coordinator::new(
         repl2.clone(),
-        Some(lease_store.clone()),
-        None,
-        None,
+        None, // manifest_store
+        None, // node_registry
         fb2,
         "test/",
         slow_config,

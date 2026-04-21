@@ -1,7 +1,9 @@
 //! HaKuzu: dead-simple embedded HA Kuzu/LadybugDB.
 //!
 //! ```ignore
-//! let db = HaKuzu::builder("my-bucket")
+//! let db = HaKuzu::builder()
+//!     .storage(Arc::new(hadb_storage_s3::S3Storage::new(s3_client, "my-bucket".into())))
+//!     .lease_store(Arc::new(hadb_lease_nats::NatsKvLeaseStore::new(nats_url).await?))
 //!     .open("/data/graph", "CREATE NODE TABLE IF NOT EXISTS Person(id INT64, name STRING, PRIMARY KEY(id))")
 //!     .await?;
 //!
@@ -206,9 +208,11 @@ impl HaKuzuInner {
 }
 
 impl HaKuzu {
-    /// Start building an HA Kuzu instance.
-    pub fn builder(bucket: &str) -> HaKuzuBuilder {
-        HaKuzuBuilder::new(bucket)
+    /// Start building an HA Kuzu instance. The caller supplies the
+    /// storage backend and lease store via the builder's setters — see
+    /// [`HaKuzuBuilder::storage`] and [`HaKuzuBuilder::lease_store`].
+    pub fn builder() -> HaKuzuBuilder {
+        HaKuzuBuilder::new()
     }
 
     /// Open a local-only Kuzu database (no HA, no S3).

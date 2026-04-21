@@ -28,7 +28,11 @@ fn build_coordinator(
     shared_db: Arc<lbug::Database>,
 ) -> (Arc<Coordinator>, Arc<KuzuReplicator>) {
     let config = CoordinatorConfig {
-        lease: Some(LeaseConfig::new(instance_id.to_string(), address.to_string())),
+        lease: Some(LeaseConfig::new(
+            lease_store,
+            instance_id.to_string(),
+            address.to_string(),
+        )),
         ..Default::default()
     };
 
@@ -43,8 +47,7 @@ fn build_coordinator(
 
     let coordinator = Coordinator::new(
         replicator.clone(),
-        Some(lease_store),
-        None,
+        None, // manifest_store
         None, // node_registry
         follower_behavior,
         "test/",
@@ -66,11 +69,70 @@ async fn builder_with_custom_lease_store_compiles() {
     // Just verify the builder chain compiles. We don't call open() because
     // that requires S3 for the replicator, but the builder should accept
     // the custom lease store.
-    let _builder = HaKuzu::builder("test-bucket")
+    let _builder = HaKuzu::builder()
         .prefix("test/")
         .instance_id("test-node")
         .address("http://localhost:19200")
         .lease_store(lease_store);
+}
+
+#[tokio::test]
+async fn builder_without_lease_store_rejects() {
+    // Regression for the lease-store safety gate: `HaKuzuBuilder::open()`
+    // must error when no `.lease_store(...)` is set. Leader election
+    // semantics depend on backend CAS atomicity (AWS S3 atomic; Tigris
+    // not), so hakuzu refuses to silently pick a default.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("no_lease");
+
+    // Provide storage so the lease check is the one that fires first.
+    let storage: Arc<dyn hadb_storage::StorageBackend> = common::MockObjectStore::new();
+    let result = HaKuzu::builder()
+        .prefix("no-lease/")
+        .instance_id("no-lease-node")
+        .address("http://localhost:19260")
+        .storage(storage)
+        .open(db_path.to_str().unwrap(), SCHEMA)
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("open() should error when no .lease_store() is set"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("lease_store"),
+        "error should mention the missing lease_store setter, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn builder_without_storage_rejects() {
+    // Regression for the storage safety gate: `HaKuzuBuilder::open()`
+    // must error when no `.storage(...)` is set. hakuzu won't silently
+    // build an S3Storage for you.
+    let tmp = TempDir::new().unwrap();
+    let db_path = tmp.path().join("no_storage");
+
+    // Provide lease store so the storage check is the one that fires.
+    let lease_store: Arc<dyn hakuzu::LeaseStore> = Arc::new(InMemoryLeaseStore::new());
+    let result = HaKuzu::builder()
+        .prefix("no-storage/")
+        .instance_id("no-storage-node")
+        .address("http://localhost:19262")
+        .lease_store(lease_store)
+        .open(db_path.to_str().unwrap(), SCHEMA)
+        .await;
+
+    let err = match result {
+        Ok(_) => panic!("open() should error when no .storage() is set"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("storage"),
+        "error should mention the missing storage setter, got: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -82,7 +144,7 @@ async fn builder_database_method_compiles() {
     let db = lbug::Database::new(&db_path, lbug::SystemConfig::default()).unwrap();
     let db = Arc::new(db);
 
-    let _builder = HaKuzu::builder("test-bucket")
+    let _builder = HaKuzu::builder()
         .prefix("test/")
         .instance_id("builder-ext")
         .address("http://localhost:19230")
@@ -101,7 +163,7 @@ async fn builder_locks_method_compiles() {
     let write_mutex = Arc::new(tokio::sync::Mutex::new(()));
     let snapshot_lock = Arc::new(std::sync::RwLock::new(()));
 
-    let _builder = HaKuzu::builder("test-bucket")
+    let _builder = HaKuzu::builder()
         .prefix("test/")
         .database(db)
         .locks(write_mutex, snapshot_lock);
@@ -122,7 +184,7 @@ async fn builder_rejects_database_without_locks() {
     let db = lbug::Database::new(&db_path, lbug::SystemConfig::default()).unwrap();
     let db = Arc::new(db);
 
-    let result = HaKuzu::builder("test-bucket")
+    let result = HaKuzu::builder()
         .prefix("test/")
         .instance_id("no-locks")
         .address("http://localhost:19260")
@@ -159,7 +221,7 @@ async fn builder_accepts_database_with_locks() {
 
     // This will attempt S3 connection and fail, but should NOT fail on
     // the database-without-locks validation.
-    let result = HaKuzu::builder("nonexistent-bucket")
+    let result = HaKuzu::builder()
         .prefix("test/")
         .instance_id("with-locks")
         .address("http://localhost:19261")
@@ -445,6 +507,7 @@ async fn failover_with_external_databases() {
     );
     let config1 = CoordinatorConfig {
         lease: Some(LeaseConfig::new(
+            lease_store.clone(),
             "failover-leader".to_string(),
             "http://localhost:19240".to_string(),
         )),
@@ -452,9 +515,8 @@ async fn failover_with_external_databases() {
     };
     let coordinator1 = Coordinator::new(
         replicator1.clone(),
-        Some(lease_store.clone()),
-        None,
-        None,
+        None, // manifest_store
+        None, // node_registry
         follower_behavior1,
         "failover/",
         config1,
@@ -483,6 +545,7 @@ async fn failover_with_external_databases() {
     );
     let config2 = CoordinatorConfig {
         lease: Some(LeaseConfig::new(
+            lease_store.clone(),
             "failover-follower".to_string(),
             "http://localhost:19241".to_string(),
         )),
@@ -490,9 +553,8 @@ async fn failover_with_external_databases() {
     };
     let coordinator2 = Coordinator::new(
         replicator2.clone(),
-        Some(lease_store.clone()),
-        None,
-        None,
+        None, // manifest_store
+        None, // node_registry
         follower_behavior2,
         "failover/",
         config2,
@@ -608,6 +670,7 @@ async fn close_drains_journal_segments() {
 
     let config = CoordinatorConfig {
         lease: Some(LeaseConfig::new(
+            lease_store,
             "drain-node".to_string(),
             "http://localhost:19250".to_string(),
         )),
@@ -615,9 +678,8 @@ async fn close_drains_journal_segments() {
     };
     let coordinator = Coordinator::new(
         replicator.clone(),
-        Some(lease_store),
-        None,
-        None,
+        None, // manifest_store
+        None, // node_registry
         follower_behavior,
         "drain/",
         config,
@@ -677,7 +739,7 @@ async fn close_drains_journal_segments() {
 
     // Verify that the object store has uploaded segments.
     // The mock object store should have at least one segment uploaded.
-    let keys = object_store.list_objects("drain/").await.unwrap();
+    let keys = object_store.list("drain/", None).await.unwrap();
     // After close, the sealed segment should have been uploaded.
     // The segment key format is: {prefix}{db_name}/journal/{filename}
     let journal_keys: Vec<_> = keys

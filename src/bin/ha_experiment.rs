@@ -361,8 +361,10 @@ async fn main() -> Result<()> {
             .with_shared_db(shared_db.clone()),
     );
 
-    // Build coordinator config.
-    let mut lease_config = LeaseConfig::new(instance_id.clone(), address.clone());
+    // Build coordinator config. Lease store now lives inside LeaseConfig
+    // (hadb Phase Fjord) — Coordinator no longer takes it as a separate arg.
+    let mut lease_config =
+        LeaseConfig::new(lease_store, instance_id.clone(), address.clone());
     lease_config.ttl_secs = args.lease_ttl;
     lease_config.renew_interval = Duration::from_millis(args.renew_interval_ms);
     lease_config.follower_poll_interval = Duration::from_millis(args.follower_poll_ms);
@@ -375,8 +377,7 @@ async fn main() -> Result<()> {
 
     let coordinator = Coordinator::new(
         replicator.clone() as Arc<dyn hadb::Replicator>,
-        Some(lease_store),
-        None,
+        None, // manifest_store
         None, // node_registry
         follower_behavior,
         &args.prefix,
